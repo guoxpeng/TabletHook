@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">TabletHook</string>
-    <string name="module_description">让微信 8.0.76 使用平板设备登录模式</string>
+    <string name="module_description">让支持的应用使用平板设备登录模式</string>
 </resources>
