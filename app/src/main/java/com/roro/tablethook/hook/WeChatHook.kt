@@ -91,6 +91,7 @@ internal class WeChatHook(
             loginAsPadEligibilityMethod,
             LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID
         )
+        hookFoldWhitelist(classLoader)
         xposed.log(Log.INFO, HookUtils.TAG, "微信平板登录模式已启用")
         HookUtils.logi("wechat dexkit hook installed")
 
@@ -154,6 +155,7 @@ internal class WeChatHook(
             elig.isAccessible = true
             HookUtils.hookBooleanMethod(xposed, env, TABLET_ENVIRONMENT_HOOK_ID)
             HookUtils.hookBooleanMethod(xposed, elig, LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID)
+            hookFoldWhitelist(classLoader)
             xposed.log(Log.INFO, HookUtils.TAG, "微信平板登录模式已启用（缓存）")
             return true
         } catch (throwable: Throwable) {
@@ -184,6 +186,45 @@ internal class WeChatHook(
             "缓存返回类型已变化：$className.$methodName"
         }
         return method
+    }
+
+    /**
+     * 折叠屏白名单钩子：欢迎屏登录点击分流看 ok.B() 与 ok.R()——B() 本体
+     * 就是调 ok.C（模块已钩成 true），B() 为 true 后 R() 为 false 会走
+     * MobileInputUI（手机号屏，无平板选项）；R() 为 true 才走 LoginSelectUI
+     * （账号列表屏，elig 回调显示 phone_and_pad）。R() 方法体是
+     * V/f0/d0/b0/T/k0/h0 的纯或，没有可用于 DexKit 定位的特征字符串，
+     * 故按类名+方法名直接反射挂钩，并校验公开静态无参 boolean 签名。
+     * 解析失败只记日志，绝不影响已有的 ok.C 与 checkloginaspad 钩子。
+     * 缓存快速通道与 DexKit 路径都调它，缓存格式不动（每次启动现解析，
+     * 一次 Class.forName + declaredMethods 扫描，开销可忽略）。
+     */
+    private fun hookFoldWhitelist(classLoader: ClassLoader): Boolean {
+        try {
+            val clazz = Class.forName(FOLD_WHITELIST_CLASS, false, classLoader)
+            val method = clazz.declaredMethods.firstOrNull { candidate ->
+                candidate.name == FOLD_WHITELIST_METHOD &&
+                    candidate.parameterTypes.isEmpty()
+            } ?: error("折叠屏白名单方法未找到：$FOLD_WHITELIST_CLASS.$FOLD_WHITELIST_METHOD")
+            check(Modifier.isPublic(method.modifiers) && Modifier.isStatic(method.modifiers)) {
+                "折叠屏白名单方法不是公开静态方法"
+            }
+            check(method.returnType.name == HookUtils.BOOLEAN_TYPE) {
+                "折叠屏白名单返回类型已变化"
+            }
+            HookUtils.hookBooleanMethod(xposed, method, FOLD_WHITELIST_HOOK_ID)
+            HookUtils.logi("wechat R hook installed")
+            return true
+        } catch (throwable: Throwable) {
+            HookUtils.logi("wechat R hook FAILED: ${throwable.message}")
+            xposed.log(
+                Log.WARN,
+                HookUtils.TAG,
+                "微信折叠屏白名单钩子失败（不影响已有钩子）",
+                throwable
+            )
+            return false
+        }
     }
 
     private fun saveCache(appDataDir: String, env: Method, elig: Method) {
@@ -223,6 +264,9 @@ internal class WeChatHook(
         private const val TABLET_ENVIRONMENT_HOOK_ID = "wechat_tablet_environment"
         private const val LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID =
             "wechat_login_as_pad_eligibility"
+        private const val FOLD_WHITELIST_CLASS = "com.tencent.mm.ui.ok"
+        private const val FOLD_WHITELIST_METHOD = "R"
+        private const val FOLD_WHITELIST_HOOK_ID = "wechat_fold_whitelist"
 
         private const val CACHE_FILE_NAME = "tablethook_wechat_cache.json"
         private const val KEY_ENV = "env"
