@@ -18,37 +18,6 @@ private const val LOGIN_SELECT_CLASS =
 private const val EXTRA_PURPOSE = "mobile_input_purpose"
 private const val FLAG_ACTIVITY_SINGLE_TOP = 0x20000000
 
-/**
- * 冷启动改道 Hooker：必须是 public 顶层类，框架靠反射找它的静态
- * before 方法（@JvmStatic 生成 JumpToLoginHooker.before），不能写成
- * internal 或局部类。只实现 before，不实现 after。
- */
-class JumpToLoginHooker : XposedInterface.Hooker {
-    companion object {
-        @JvmStatic
-        fun before(callback: XposedInterface.BeforeHookCallback) {
-            try {
-                val context = callback.args[0] as Context
-                val intent = Intent().apply {
-                    setClassName(context, LOGIN_SELECT_CLASS)
-                    putExtra(EXTRA_PURPOSE, 1)
-                    addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                            FLAG_ACTIVITY_SINGLE_TOP
-                    )
-                }
-                context.startActivity(intent)
-                HookUtils.logi("wechat jump redirected to LoginSelectUI")
-                callback.returnAndSkip(null)
-            } catch (throwable: Throwable) {
-                HookUtils.logi(
-                    "wechat jump redirect FAILED: ${throwable.message}"
-                )
-            }
-        }
-    }
-}
-
 internal class WeChatHook(
     private val xposed: XposedInterface
 ) {
@@ -273,14 +242,18 @@ internal class WeChatHook(
      * LoginPasswordUI，所以光钩 R() 不够——R 只修欢迎屏的分流，冷启动
      * 这条路碰不到它。改道做法：按类名+方法名直接反射解析
      * LauncherUI.jumpToLogin(Context)V（单 Context 参数、void 返回，
-     * 静态与否不限，解析时不校验 static），用 libxposed 的 Hooker 类
-     * 静态 before(BeforeHookCallback) + returnAndSkip(null) 跳过原方法
-     * ——这就是 beforeHook+setResult 在 libxposed 里的正确写法（第一版
-     * 用的 intercept lambda 参数无法推断类型，CI 编译失败，已改掉）。
-     * before 体内自己建一个到 LoginSelectUI（账号列表屏）的 intent，带
-     * mobile_input_purpose=1 extra（与 resumeLogoutJump 直达分支一致），
-     * 用传入的 Context startActivity；before 体内任何异常都记日志且
-     * 不 skip，原方法继续执行（密码屏），登录流程不断。
+     * 静态与否不限，解析时不校验 static），用 libxposed 102 的
+     * HookBuilder.intercept(Hooker)：Hooker 只有一个方法
+     * intercept(Chain)，Chain.getArg(0) 取传入的 Context，
+     * 不调 proceed() 即跳过原方法（void 方法返回 null 即可）。
+     * 前两版都编不过已作废：第一版 intercept lambda 参数无法推断
+     * 类型；第二版用的 BeforeHookCallback 在 102.0.0 里根本不存在
+     * （Hooker 的抽象方法是 intercept(Chain)，不是静态 before）。
+     * intercept 体内自己建一个到 LoginSelectUI（账号列表屏）的
+     * intent，带 mobile_input_purpose=1 extra（与 resumeLogoutJump
+     * 直达分支一致），用传入的 Context startActivity；体内任何异常
+     * 都记日志并调 chain.proceed() 跑原方法（密码屏），登录流程不断。
+     * 为避开 lambda 参数推断问题，Hooker 用显式匿名对象实现。
      * 标志位说明：FLAG_ACTIVITY_NEW_TASK（常量，0x10000000）保证
      * 非 Activity Context 也能 startActivity；0x20000000 是
      * FLAG_ACTIVITY_SINGLE_TOP，与微信自己发 LoginSelectUI intent 时
@@ -300,7 +273,36 @@ internal class WeChatHook(
                 "冷启动改道方法返回类型已变化"
             }
             method.isAccessible = true
-            xposed.hook(method, JumpToLoginHooker::class.java)
+            xposed.hook(method)
+                .setId(JUMP_HOOK_ID)
+                .intercept(object : XposedInterface.Hooker {
+                    override fun intercept(
+                        chain: XposedInterface.Chain
+                    ): Any? {
+                        try {
+                            val context = chain.getArg(0) as Context
+                            val intent = Intent().apply {
+                                setClassName(context, LOGIN_SELECT_CLASS)
+                                putExtra(EXTRA_PURPOSE, 1)
+                                addFlags(
+                                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                                        FLAG_ACTIVITY_SINGLE_TOP
+                                )
+                            }
+                            context.startActivity(intent)
+                            HookUtils.logi(
+                                "wechat jump redirected to LoginSelectUI"
+                            )
+                            return null
+                        } catch (throwable: Throwable) {
+                            HookUtils.logi(
+                                "wechat jump redirect FAILED: " +
+                                    "${throwable.message}"
+                            )
+                            return chain.proceed()
+                        }
+                    }
+                })
             HookUtils.logi("wechat jump hook installed")
             return true
         } catch (throwable: Throwable) {
@@ -357,6 +359,7 @@ internal class WeChatHook(
         private const val FOLD_WHITELIST_HOOK_ID = "wechat_fold_whitelist"
         private const val JUMP_CLASS = "com.tencent.mm.ui.LauncherUI"
         private const val JUMP_METHOD = "jumpToLogin"
+        private const val JUMP_HOOK_ID = "wechat_jump_to_login"
 
         private const val CACHE_FILE_NAME = "tablethook_wechat_cache.json"
         private const val KEY_ENV = "env"
