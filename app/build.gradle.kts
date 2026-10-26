@@ -9,7 +9,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.roro.tablethook"
+        applicationId = "com.roro.tablethook.test"
         minSdk = 30
         targetSdk = 36
         versionCode = 2
