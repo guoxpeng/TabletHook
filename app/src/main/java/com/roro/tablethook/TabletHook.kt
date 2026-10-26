@@ -19,6 +19,7 @@ class TabletHook : XposedModule() {
                 processName == QqHook.PROCESS_NAME ||
                 processName == PddHook.PROCESS_NAME
         }
+        HookUtils.logi("onModuleLoaded process=${param.processName} matched=$targetProcessName")
     }
 
     override fun onPackageReady(param: PackageReadyParam) {
@@ -33,6 +34,11 @@ class TabletHook : XposedModule() {
             param.applicationInfo.dataDir,
             "entry process=$processName package=${param.packageName} " +
                 "expected=$expectedPackage isFirst=${param.isFirstPackage}"
+        )
+        HookUtils.logi(
+            "entry process=$processName package=${param.packageName} " +
+                "expected=$expectedPackage isFirst=${param.isFirstPackage} " +
+                "dataDir=${param.applicationInfo.dataDir}"
         )
         if (param.packageName != expectedPackage || !param.isFirstPackage) {
             return
@@ -60,6 +66,9 @@ class TabletHook : XposedModule() {
         } catch (throwable: Throwable) {
             HookUtils.trace(
                 param.applicationInfo.dataDir,
+                "entry FAILED: " + throwable.stackTraceToString().take(2000)
+            )
+            HookUtils.logi(
                 "entry FAILED: " + throwable.stackTraceToString().take(2000)
             )
             log(Log.ERROR, HookUtils.TAG, "$processName 平板登录 Hook 初始化失败", throwable)

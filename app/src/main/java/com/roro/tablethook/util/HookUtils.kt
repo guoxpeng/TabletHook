@@ -28,6 +28,17 @@ internal object HookUtils {
         }
     }
 
+    /**
+     * 文件追踪在实机上一个字都没写出来（原因未明），改走 android.util.Log，
+     * 直接进 logcat，root 一定能读到。同样失败静默。
+     */
+    fun logi(line: String) {
+        try {
+            android.util.Log.i("TabletHookTrace", line)
+        } catch (_: Throwable) {
+        }
+    }
+
     fun loadDexKitLibrary(nativeLibraryDir: String?) {
         check(!nativeLibraryDir.isNullOrEmpty()) {
             "无法获取模块 native library 目录"
