@@ -41,7 +41,11 @@ class TabletHook : XposedModule() {
                         bridge,
                         param.classLoader
                     )
-                    QqHook.PROCESS_NAME -> QqHook(this).install(bridge, param.classLoader)
+                    QqHook.PROCESS_NAME -> QqHook(this).install(
+                        bridge,
+                        param.classLoader,
+                        param.applicationInfo.dataDir
+                    )
                     PddHook.PROCESS_NAME -> PddHook(this).install(
                         bridge,
                         param.classLoader
