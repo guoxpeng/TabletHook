@@ -1,6 +1,6 @@
 package com.roro.tablethook.hook
 
-import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.util.Log
@@ -246,12 +246,19 @@ internal class WeChatHook(
      * 不混淆，可按类名+方法名直接反射挂钩（只认 LoginPasswordUI
      * 自身声明的方法，不往父类找，避免误钩共用基类的其他 Activity）。
      * 做法是 afterHook：先跑原 onCreate，再看进程内静态标志位；若是
-     * 本进程内第一次创建 LoginPasswordUI，则置位，用该 Activity 起
-     * 一个到 LoginSelectUI（账号列表屏）的 intent（带
+     * 本进程内第一次创建 LoginPasswordUI，则置位，用 Application
+     * 上下文起一个到 LoginSelectUI（账号列表屏）的 intent（带
      * mobile_input_purpose=1 extra，与 resumeLogoutJump 直达分支
-     * 一致），然后 finish() 掉密码屏；后续再创建 LoginPasswordUI
-     * （例如从账号列表屏点账号回来）不再改道，避免循环。只改道，
-     * 不碰账号、不读密码；钩体内异常只记日志，不阻断原流程。
+     * 一致）；后续再创建 LoginPasswordUI（例如从账号列表屏点账号
+     * 回来）不再改道，避免循环。只改道，不碰账号、不读密码；
+     * 钩体内异常只记日志，不阻断原流程。
+     * 注意：原计划用该 Activity 起 intent 并 finish() 掉密码屏，但
+     * libxposed 102 的 Chain 根本没有取 receiver 的方法
+     * （chain.getThis() 编译期 Unresolved reference，CI 已证实），
+     * 故改用 ActivityThread.currentApplication() 作上下文；代价是
+     * 密码屏仍留在返回栈底层（从账号列表屏按返回会回到它，但标志
+     * 位已置位不再改道，不会循环），实测目标（账号列表屏出现）不受
+     * 影响。
      * 标志位说明：FLAG_ACTIVITY_NEW_TASK（常量，0x10000000）与
      * 0x20000000（FLAG_ACTIVITY_SINGLE_TOP，与微信自己发
      * LoginSelectUI intent 时用的标志一致），两者都加。
@@ -280,17 +287,16 @@ internal class WeChatHook(
                         try {
                             if (!passwordRedirectDone) {
                                 passwordRedirectDone = true
-                                val activity = chain.getThis() as Activity
+                                val context = currentApplicationContext()
                                 val intent = Intent().apply {
-                                    setClassName(activity, LOGIN_SELECT_CLASS)
+                                    setClassName(context, LOGIN_SELECT_CLASS)
                                     putExtra(EXTRA_PURPOSE, 1)
                                     addFlags(
                                         Intent.FLAG_ACTIVITY_NEW_TASK or
                                             FLAG_ACTIVITY_SINGLE_TOP
                                     )
                                 }
-                                activity.startActivity(intent)
-                                activity.finish()
+                                context.startActivity(intent)
                                 HookUtils.logi(
                                     "wechat password redirected to LoginSelectUI"
                                 )
@@ -316,6 +322,19 @@ internal class WeChatHook(
             )
             return false
         }
+    }
+
+    /**
+     * 取 Application 上下文：libxposed 102 的 Chain 不提供 receiver，
+     * 故不用 hook 回调的 this，改走 ActivityThread.currentApplication()
+     * 反射（各家 SDK 常用做法）。取不到时抛错，由调用方记日志并走
+     * 原流程（密码屏正常显示），绝不阻断登录。
+     */
+    private fun currentApplicationContext(): Context {
+        val activityThread = Class.forName("android.app.ActivityThread")
+        val app = activityThread.getMethod("currentApplication").invoke(null)
+            ?: error("ActivityThread.currentApplication() 返回 null")
+        return app as Context
     }
 
     private fun saveCache(appDataDir: String, env: Method, elig: Method) {
