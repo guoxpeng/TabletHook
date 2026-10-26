@@ -238,91 +238,90 @@ internal class WeChatHook(
     }
 
     /**
-     * 密码屏首次启动改道钩子：上一版的 LauncherUI.jumpToLogin 改道已
-     * 删掉——jumpToLogin 只是 O7 大方法（2967-4502 行）内部的日志标签
-     * 字符串，LauncherUI 里根本没有这个名的方法，按名钩必然报“方法
-     * 未找到”，实机新进程 3201（1.0.3）已证实。故改道点移到
-     * LoginPasswordUI 自身：onCreate 是 Activity 生命周期方法，方法名
-     * 不混淆，可按类名+方法名直接反射挂钩（只认 LoginPasswordUI
-     * 自身声明的方法，不往父类找，避免误钩共用基类的其他 Activity）。
-     * 做法是 afterHook：先跑原 onCreate，再看进程内静态标志位；若是
-     * 本进程内第一次创建 LoginPasswordUI，则置位，用 Application
-     * 上下文起一个到 LoginSelectUI（账号列表屏）的 intent（带
-     * mobile_input_purpose=1 extra，与 resumeLogoutJump 直达分支
-     * 一致）；后续再创建 LoginPasswordUI（例如从账号列表屏点账号
-     * 回来）不再改道，避免循环。只改道，不碰账号、不读密码；
-     * 钩体内异常只记日志，不阻断原流程。
-     * 注意：原计划用该 Activity 起 intent 并 finish() 掉密码屏，但
-     * libxposed 102 的 Chain 根本没有取 receiver 的方法
-     * （chain.getThis() 编译期 Unresolved reference，CI 已证实），
-     * 故改用 ActivityThread.currentApplication() 作上下文；代价是
-     * 密码屏仍留在返回栈底层（从账号列表屏按返回会回到它，但标志
-     * 位已置位不再改道，不会循环），实测目标（账号列表屏出现）不受
-     * 影响。
-     * 标志位说明：FLAG_ACTIVITY_NEW_TASK（常量，0x10000000）与
-     * 0x20000000（FLAG_ACTIVITY_SINGLE_TOP，与微信自己发
-     * LoginSelectUI intent 时用的标志一致），两者都加。
+     * 父类对照实验钩子：上一版直接钩 LoginPasswordUI.onCreate 的改道
+     * （1.0.4 建、1.0.5 加诊断）注册显示“已装”，但实机新进程里
+     * intercept 入口日志一次都没出现，尽管钩子装在 onCreate 之前、
+     * 密码屏也正常显示；已排除方法不存在（smali 确认 public
+     * onCreate(Bundle)）、hook ID 冲突、时序、进程错误、缓存漏调、
+     * 标志位初始值。全模块至今没有任何钩子有触发实证（只有“已装”
+     * 日志），故做对照实验：改钩父类 LoginHistoryUI.onCreate——
+     * LoginPasswordUI.onCreate 内第一行就是调它的 super，必经之路。
+     * 写法改回 lambda 形式（与 HookUtils.hookBooleanMethod 一致，
+     * 顺带排除对象形式差异）。intercept 内先记入口日志，再用
+     * chain.getThisObject() 判定实例是否为 LoginPasswordUI：不是
+     * 则直接 proceed() 返回；是且进程内静态标志位为 false 时才置
+     * 位，并用 Application 上下文起一个到 LoginSelectUI（账号列表
+     * 屏）的 intent（带 mobile_input_purpose=1 extra，与
+     * resumeLogoutJump 直达分支一致）；后续再创建密码屏不再改道，
+     * 避免循环。只改道，不碰账号、不读密码；钩体内异常只记日志，
+     * 不阻断原流程。注意：仍用 Application 上下文（不 finish 密码
+     * 屏），密码屏仍留在返回栈底层（从账号列表屏按返回会回到它，
+     * 但标志位已置位不再改道，不会循环）。
+     * 判读标准：父类 intercept 出现且改道成功→方法特异性实锤；
+     * 父类 intercept 也不出现→机制层失效。
      * 缓存快速通道与 DexKit 路径都调它，缓存格式不动（每次启动现解析）。
      * 解析失败只记日志，绝不影响已有的 ok.C、checkloginaspad、R 钩子。
      */
     private fun hookPasswordFirstRedirect(classLoader: ClassLoader): Boolean {
         try {
-            val clazz = Class.forName(PASSWORD_CLASS, false, classLoader)
+            val clazz = Class.forName(PARENT_CLASS, false, classLoader)
             val method = clazz.declaredMethods.firstOrNull { candidate ->
                 candidate.name == PASSWORD_METHOD &&
                     candidate.parameterTypes.map { it.name } ==
                     listOf(Bundle::class.java.name)
-            } ?: error("密码屏改道方法未找到：$PASSWORD_CLASS.$PASSWORD_METHOD")
+            } ?: error("父类改道方法未找到：$PARENT_CLASS.$PASSWORD_METHOD")
             check(method.returnType.name == HookUtils.VOID_TYPE) {
-                "密码屏改道方法返回类型已变化"
+                "父类改道方法返回类型已变化"
             }
             method.isAccessible = true
             xposed.hook(method)
-                .setId(PASSWORD_HOOK_ID)
-                .intercept(object : XposedInterface.Hooker {
-                    override fun intercept(
-                        chain: XposedInterface.Chain
-                    ): Any? {
-                        HookUtils.logi("wechat password intercept fired")
-                        val result = chain.proceed()
-                        try {
-                            HookUtils.logi(
-                                "wechat password intercept " +
-                                    "flag=$passwordRedirectDone"
-                            )
-                            if (!passwordRedirectDone) {
-                                passwordRedirectDone = true
-                                val context = currentApplicationContext()
-                                val intent = Intent().apply {
-                                    setClassName(context, LOGIN_SELECT_CLASS)
-                                    putExtra(EXTRA_PURPOSE, 1)
-                                    addFlags(
-                                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                                            FLAG_ACTIVITY_SINGLE_TOP
-                                    )
-                                }
-                                context.startActivity(intent)
-                                HookUtils.logi(
-                                    "wechat password redirected to LoginSelectUI"
+                .setId(PARENT_HOOK_ID)
+                .intercept { chain ->
+                    HookUtils.logi("wechat parent intercept fired")
+                    val receiver = chain.getThisObject()
+                    if (receiver == null ||
+                        receiver.javaClass.name != PASSWORD_CLASS
+                    ) {
+                        return@intercept chain.proceed()
+                    }
+                    val result = chain.proceed()
+                    try {
+                        HookUtils.logi(
+                            "wechat password intercept " +
+                                "flag=$passwordRedirectDone"
+                        )
+                        if (!passwordRedirectDone) {
+                            passwordRedirectDone = true
+                            val context = currentApplicationContext()
+                            val intent = Intent().apply {
+                                setClassName(context, LOGIN_SELECT_CLASS)
+                                putExtra(EXTRA_PURPOSE, 1)
+                                addFlags(
+                                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                                        FLAG_ACTIVITY_SINGLE_TOP
                                 )
                             }
-                        } catch (throwable: Throwable) {
+                            context.startActivity(intent)
                             HookUtils.logi(
-                                "wechat password redirect FAILED: " +
-                                    "${throwable.message}"
+                                "wechat password redirected to LoginSelectUI"
                             )
                         }
-                        return result
+                    } catch (throwable: Throwable) {
+                        HookUtils.logi(
+                            "wechat password redirect FAILED: " +
+                                "${throwable.message}"
+                        )
                     }
-                })
-            HookUtils.logi("wechat password hook installed")
+                    result
+                }
+            HookUtils.logi("wechat parent hook installed")
             return true
         } catch (throwable: Throwable) {
-            HookUtils.logi("wechat password hook FAILED: ${throwable.message}")
+            HookUtils.logi("wechat parent hook FAILED: ${throwable.message}")
             xposed.log(
                 Log.WARN,
                 HookUtils.TAG,
-                "微信密码屏改道钩子失败（不影响已有钩子）",
+                "微信父类改道钩子失败（不影响已有钩子）",
                 throwable
             )
             return false
@@ -384,8 +383,10 @@ internal class WeChatHook(
         private const val FOLD_WHITELIST_HOOK_ID = "wechat_fold_whitelist"
         private const val PASSWORD_CLASS =
             "com.tencent.mm.plugin.account.ui.LoginPasswordUI"
+        private const val PARENT_CLASS =
+            "com.tencent.mm.plugin.account.ui.LoginHistoryUI"
         private const val PASSWORD_METHOD = "onCreate"
-        private const val PASSWORD_HOOK_ID = "wechat_password_first_redirect"
+        private const val PARENT_HOOK_ID = "wechat_password_parent_redirect"
 
         // 进程内静态标志：密码屏首次创建才改道，后续创建不再改道，避免循环。
         private var passwordRedirectDone = false
