@@ -56,17 +56,8 @@ class TabletHook : XposedModule() {
                     return
                 }
             }
-            // 微信：同 QQ，先试缓存再建桥。微信主进程重启后平板判定读得早，
-            // 建桥的数秒窗口足以让它按手机显示。
-            if (processName == WeChatHook.PROCESS_NAME) {
-                val dataDir = param.applicationInfo.dataDir
-                if (dataDir != null &&
-                    WeChatHook(this).tryCachedHook(param.classLoader, dataDir)
-                ) {
-                    HookUtils.logi("wechat cache HIT hook installed (no bridge)")
-                    return
-                }
-            }
+            // 对照版（1.0.7）：微信缓存捷径已关，恒走下面的 DexKit 路径。
+            // QQ 的缓存捷径保持不动（本次不测 QQ）。
             HookUtils.loadDexKitLibrary(getModuleApplicationInfo().nativeLibraryDir)
             DexKitBridge.create(param.applicationInfo.sourceDir).use { bridge ->
                 when (processName) {
