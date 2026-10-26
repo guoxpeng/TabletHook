@@ -17,9 +17,12 @@ internal class QqHook(
         // 登录包可能已经按手机身份发出，导致另一台手机被挤下线。
         // 首次解析成功后把目标方法缓存到 QQ 自身 files 目录，后续 MSF 启动
         // 直接反射挂钩（毫秒级），QQ 更新导致缓存失效时自动回落 DexKit 重搜。
+        HookUtils.trace(appDataDir, "qq install start")
         if (appDataDir != null && tryCachedHook(classLoader, appDataDir)) {
+            HookUtils.trace(appDataDir, "qq cache HIT hook installed")
             return
         }
+        HookUtils.trace(appDataDir, "qq cache MISS dexkit start")
 
         val configClasses = bridge.findClass {
             matcher {
@@ -98,6 +101,7 @@ internal class QqHook(
             .setId(TABLET_CLIENT_HOOK_ID)
             .intercept { tabletValue }
         xposed.log(Log.INFO, HookUtils.TAG, "QQ MSF 平板设备类型已启用")
+        HookUtils.trace(appDataDir, "qq dexkit hook installed")
 
         if (appDataDir != null) {
             try {
@@ -107,7 +111,12 @@ internal class QqHook(
                     deviceTypeGetter.name,
                     deviceTypeGetterData.returnTypeName
                 )
+                HookUtils.trace(appDataDir, "qq cache saved")
             } catch (throwable: Throwable) {
+                HookUtils.trace(
+                    appDataDir,
+                    "qq cache save FAILED: " + throwable.stackTraceToString().take(1000)
+                )
                 xposed.log(
                     Log.WARN,
                     HookUtils.TAG,
@@ -154,6 +163,10 @@ internal class QqHook(
             xposed.log(Log.INFO, HookUtils.TAG, "QQ MSF 平板设备类型已启用（缓存）")
             return true
         } catch (throwable: Throwable) {
+            HookUtils.trace(
+                appDataDir,
+                "qq cache invalid: ${throwable.message}"
+            )
             xposed.log(
                 Log.WARN,
                 HookUtils.TAG,

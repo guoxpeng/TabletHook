@@ -29,6 +29,11 @@ class TabletHook : XposedModule() {
             PddHook.PROCESS_NAME -> PddHook.PACKAGE_NAME
             else -> return
         }
+        HookUtils.trace(
+            param.applicationInfo.dataDir,
+            "entry process=$processName package=${param.packageName} " +
+                "expected=$expectedPackage isFirst=${param.isFirstPackage}"
+        )
         if (param.packageName != expectedPackage || !param.isFirstPackage) {
             return
         }
@@ -53,6 +58,10 @@ class TabletHook : XposedModule() {
                 }
             }
         } catch (throwable: Throwable) {
+            HookUtils.trace(
+                param.applicationInfo.dataDir,
+                "entry FAILED: " + throwable.stackTraceToString().take(2000)
+            )
             log(Log.ERROR, HookUtils.TAG, "$processName 平板登录 Hook 初始化失败", throwable)
         }
     }
