@@ -19,10 +19,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Accept licenses and install SDK 37
+      # runner 上 sdkmanager 不在 PATH 里，用 ANDROID_HOME 定位它。
+      - name: Install SDK 37
         run: |
-          yes | sdkmanager --licenses
-          sdkmanager "platforms;android-37" "build-tools;35.0.0"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -n1)
+          yes | "$SDKMANAGER" --licenses
+          "$SDKMANAGER" "platforms;android-37" "build-tools;35.0.0"
 
       - name: Build debug APK
         run: ./gradlew assembleDebug --stacktrace
