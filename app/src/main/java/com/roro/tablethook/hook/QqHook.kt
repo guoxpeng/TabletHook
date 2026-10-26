@@ -139,7 +139,11 @@ internal class QqHook(
         return File(File(appDataDir, "files"), CACHE_FILE_NAME)
     }
 
-    private fun tryCachedHook(classLoader: ClassLoader, appDataDir: String): Boolean {
+    /**
+     * 缓存快速通道（不依赖 DexKit 桥）：入口在建桥之前先调它，
+     * 建桥要数秒，登录可能抢在这之前，缓存命中就直接挂钩返回。
+     */
+    internal fun tryCachedHook(classLoader: ClassLoader, appDataDir: String): Boolean {
         val file = cacheFile(appDataDir)
         if (!file.isFile) {
             return false

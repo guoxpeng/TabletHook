@@ -45,6 +45,17 @@ class TabletHook : XposedModule() {
         }
 
         try {
+            // QQ：先试缓存快速通道，不创建 DexKit 桥。建桥要数秒（实测约 9 秒），
+            // MSF 自动登录可能抢在这之前，缓存命中就直接挂钩返回，彻底关上竞速窗口。
+            if (processName == QqHook.PROCESS_NAME) {
+                val dataDir = param.applicationInfo.dataDir
+                if (dataDir != null &&
+                    QqHook(this).tryCachedHook(param.classLoader, dataDir)
+                ) {
+                    HookUtils.logi("qq cache HIT hook installed (no bridge)")
+                    return
+                }
+            }
             HookUtils.loadDexKitLibrary(getModuleApplicationInfo().nativeLibraryDir)
             DexKitBridge.create(param.applicationInfo.sourceDir).use { bridge ->
                 when (processName) {
