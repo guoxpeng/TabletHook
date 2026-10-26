@@ -1,5 +1,7 @@
 package com.roro.tablethook.hook
 
+import android.content.Context
+import android.content.Intent
 import android.util.Log
 import com.roro.tablethook.util.HookUtils
 import io.github.libxposed.api.XposedInterface
@@ -92,6 +94,7 @@ internal class WeChatHook(
             LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID
         )
         hookFoldWhitelist(classLoader)
+        hookJumpRedirect(classLoader)
         xposed.log(Log.INFO, HookUtils.TAG, "微信平板登录模式已启用")
         HookUtils.logi("wechat dexkit hook installed")
 
@@ -156,6 +159,7 @@ internal class WeChatHook(
             HookUtils.hookBooleanMethod(xposed, env, TABLET_ENVIRONMENT_HOOK_ID)
             HookUtils.hookBooleanMethod(xposed, elig, LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID)
             hookFoldWhitelist(classLoader)
+            hookJumpRedirect(classLoader)
             xposed.log(Log.INFO, HookUtils.TAG, "微信平板登录模式已启用（缓存）")
             return true
         } catch (throwable: Throwable) {
@@ -227,6 +231,79 @@ internal class WeChatHook(
         }
     }
 
+    /**
+     * 冷启动改道钩子：实机冷启动根本不走欢迎屏 WelcomeActivity，而是
+     * LauncherUI.jumpToLogin(Context) 在方法内建 intent 直达密码屏
+     * LoginPasswordUI，所以光钩 R() 不够——R 只修欢迎屏的分流，冷启动
+     * 这条路碰不到它。改道做法：按类名+方法名直接反射解析
+     * LauncherUI.jumpToLogin(Context)V（单 Context 参数、void 返回，
+     * 静态与否不限，解析时不校验 static），用 libxposed 的 intercept
+     * 整体替换它——新 API 没有 beforeHook+setResult，intercept 本身
+     * 就是“原方法不执行、返回值由拦截器给”，void 方法返回 null 即可。
+     * 拦截体内自己建一个到 LoginSelectUI（账号列表屏）的 intent，带
+     * mobile_input_purpose=1 extra（与 resumeLogoutJump 直达分支一致），
+     * 用传入的 Context startActivity；拦截体内任何异常都记日志并用
+     * invokeOrigin 回落原方法，绝不让登录流程崩掉。
+     * 标志位说明：FLAG_ACTIVITY_NEW_TASK（常量，0x10000000）保证
+     * 非 Activity Context 也能 startActivity；0x20000000 是
+     * FLAG_ACTIVITY_SINGLE_TOP，与微信自己发 LoginSelectUI intent 时
+     * 用的标志一致（resumeLogoutJump 里就是这个值），两者都加。
+     * 缓存快速通道与 DexKit 路径都调它，缓存格式不动（每次启动现解析）。
+     * 解析失败只记日志，绝不影响已有的 ok.C、checkloginaspad、R 钩子。
+     */
+    private fun hookJumpRedirect(classLoader: ClassLoader): Boolean {
+        try {
+            val clazz = Class.forName(JUMP_CLASS, false, classLoader)
+            val method = clazz.declaredMethods.firstOrNull { candidate ->
+                candidate.name == JUMP_METHOD &&
+                    candidate.parameterTypes.map { it.name } ==
+                    listOf(Context::class.java.name)
+            } ?: error("冷启动改道方法未找到：$JUMP_CLASS.$JUMP_METHOD")
+            check(method.returnType.name == HookUtils.VOID_TYPE) {
+                "冷启动改道方法返回类型已变化"
+            }
+            method.isAccessible = true
+            xposed.hook(method)
+                .setId(JUMP_HOOK_ID)
+                .intercept { invocation ->
+                    try {
+                        val context = invocation.arguments[0] as Context
+                        val intent = Intent().apply {
+                            setClassName(context, LOGIN_SELECT_CLASS)
+                            putExtra(EXTRA_PURPOSE, 1)
+                            addFlags(
+                                Intent.FLAG_ACTIVITY_NEW_TASK or
+                                    FLAG_ACTIVITY_SINGLE_TOP
+                            )
+                        }
+                        context.startActivity(intent)
+                        HookUtils.logi("wechat jump redirected to LoginSelectUI")
+                    } catch (throwable: Throwable) {
+                        HookUtils.logi(
+                            "wechat jump redirect FAILED: ${throwable.message}"
+                        )
+                        xposed.invokeOrigin(
+                            method,
+                            invocation.thisObject,
+                            *invocation.arguments
+                        )
+                    }
+                    null
+                }
+            HookUtils.logi("wechat jump hook installed")
+            return true
+        } catch (throwable: Throwable) {
+            HookUtils.logi("wechat jump hook FAILED: ${throwable.message}")
+            xposed.log(
+                Log.WARN,
+                HookUtils.TAG,
+                "微信冷启动改道钩子失败（不影响已有钩子）",
+                throwable
+            )
+            return false
+        }
+    }
+
     private fun saveCache(appDataDir: String, env: Method, elig: Method) {
         val dir = File(appDataDir, "files")
         if (!dir.isDirectory) {
@@ -267,6 +344,13 @@ internal class WeChatHook(
         private const val FOLD_WHITELIST_CLASS = "com.tencent.mm.ui.ok"
         private const val FOLD_WHITELIST_METHOD = "R"
         private const val FOLD_WHITELIST_HOOK_ID = "wechat_fold_whitelist"
+        private const val JUMP_CLASS = "com.tencent.mm.ui.LauncherUI"
+        private const val JUMP_METHOD = "jumpToLogin"
+        private const val JUMP_HOOK_ID = "wechat_jump_to_login"
+        private const val LOGIN_SELECT_CLASS =
+            "com.tencent.mm.plugin.account.ui.LoginSelectUI"
+        private const val EXTRA_PURPOSE = "mobile_input_purpose"
+        private const val FLAG_ACTIVITY_SINGLE_TOP = 0x20000000
 
         private const val CACHE_FILE_NAME = "tablethook_wechat_cache.json"
         private const val KEY_ENV = "env"
