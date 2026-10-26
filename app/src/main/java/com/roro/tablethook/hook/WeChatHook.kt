@@ -283,8 +283,13 @@ internal class WeChatHook(
                     override fun intercept(
                         chain: XposedInterface.Chain
                     ): Any? {
+                        HookUtils.logi("wechat password intercept fired")
                         val result = chain.proceed()
                         try {
+                            HookUtils.logi(
+                                "wechat password intercept " +
+                                    "flag=$passwordRedirectDone"
+                            )
                             if (!passwordRedirectDone) {
                                 passwordRedirectDone = true
                                 val context = currentApplicationContext()
