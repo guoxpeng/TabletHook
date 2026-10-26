@@ -5,15 +5,13 @@ plugins {
 android {
     namespace = "com.roro.tablethook"
     compileSdk {
-        version = release(37) {
-            minorApiLevel = 1
-        }
+        version = release(36)
     }
 
     defaultConfig {
         applicationId = "com.roro.tablethook"
         minSdk = 30
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 2
         versionName = "1.0.1"
     }
