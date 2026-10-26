@@ -1,7 +1,8 @@
 package com.roro.tablethook.hook
 
-import android.content.Context
+import android.app.Activity
 import android.content.Intent
+import android.os.Bundle
 import android.util.Log
 import com.roro.tablethook.util.HookUtils
 import io.github.libxposed.api.XposedInterface
@@ -99,7 +100,7 @@ internal class WeChatHook(
             LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID
         )
         hookFoldWhitelist(classLoader)
-        hookJumpRedirect(classLoader)
+        hookPasswordFirstRedirect(classLoader)
         xposed.log(Log.INFO, HookUtils.TAG, "微信平板登录模式已启用")
         HookUtils.logi("wechat dexkit hook installed")
 
@@ -164,7 +165,7 @@ internal class WeChatHook(
             HookUtils.hookBooleanMethod(xposed, env, TABLET_ENVIRONMENT_HOOK_ID)
             HookUtils.hookBooleanMethod(xposed, elig, LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID)
             hookFoldWhitelist(classLoader)
-            hookJumpRedirect(classLoader)
+            hookPasswordFirstRedirect(classLoader)
             xposed.log(Log.INFO, HookUtils.TAG, "微信平板登录模式已启用（缓存）")
             return true
         } catch (throwable: Throwable) {
@@ -237,80 +238,80 @@ internal class WeChatHook(
     }
 
     /**
-     * 冷启动改道钩子：实机冷启动根本不走欢迎屏 WelcomeActivity，而是
-     * LauncherUI.jumpToLogin(Context) 在方法内建 intent 直达密码屏
-     * LoginPasswordUI，所以光钩 R() 不够——R 只修欢迎屏的分流，冷启动
-     * 这条路碰不到它。改道做法：按类名+方法名直接反射解析
-     * LauncherUI.jumpToLogin(Context)V（单 Context 参数、void 返回，
-     * 静态与否不限，解析时不校验 static），用 libxposed 102 的
-     * HookBuilder.intercept(Hooker)：Hooker 只有一个方法
-     * intercept(Chain)，Chain.getArg(0) 取传入的 Context，
-     * 不调 proceed() 即跳过原方法（void 方法返回 null 即可）。
-     * 前两版都编不过已作废：第一版 intercept lambda 参数无法推断
-     * 类型；第二版用的 BeforeHookCallback 在 102.0.0 里根本不存在
-     * （Hooker 的抽象方法是 intercept(Chain)，不是静态 before）。
-     * intercept 体内自己建一个到 LoginSelectUI（账号列表屏）的
-     * intent，带 mobile_input_purpose=1 extra（与 resumeLogoutJump
-     * 直达分支一致），用传入的 Context startActivity；体内任何异常
-     * 都记日志并调 chain.proceed() 跑原方法（密码屏），登录流程不断。
-     * 为避开 lambda 参数推断问题，Hooker 用显式匿名对象实现。
-     * 标志位说明：FLAG_ACTIVITY_NEW_TASK（常量，0x10000000）保证
-     * 非 Activity Context 也能 startActivity；0x20000000 是
-     * FLAG_ACTIVITY_SINGLE_TOP，与微信自己发 LoginSelectUI intent 时
-     * 用的标志一致（resumeLogoutJump 里就是这个值），两者都加。
+     * 密码屏首次启动改道钩子：上一版的 LauncherUI.jumpToLogin 改道已
+     * 删掉——jumpToLogin 只是 O7 大方法（2967-4502 行）内部的日志标签
+     * 字符串，LauncherUI 里根本没有这个名的方法，按名钩必然报“方法
+     * 未找到”，实机新进程 3201（1.0.3）已证实。故改道点移到
+     * LoginPasswordUI 自身：onCreate 是 Activity 生命周期方法，方法名
+     * 不混淆，可按类名+方法名直接反射挂钩（只认 LoginPasswordUI
+     * 自身声明的方法，不往父类找，避免误钩共用基类的其他 Activity）。
+     * 做法是 afterHook：先跑原 onCreate，再看进程内静态标志位；若是
+     * 本进程内第一次创建 LoginPasswordUI，则置位，用该 Activity 起
+     * 一个到 LoginSelectUI（账号列表屏）的 intent（带
+     * mobile_input_purpose=1 extra，与 resumeLogoutJump 直达分支
+     * 一致），然后 finish() 掉密码屏；后续再创建 LoginPasswordUI
+     * （例如从账号列表屏点账号回来）不再改道，避免循环。只改道，
+     * 不碰账号、不读密码；钩体内异常只记日志，不阻断原流程。
+     * 标志位说明：FLAG_ACTIVITY_NEW_TASK（常量，0x10000000）与
+     * 0x20000000（FLAG_ACTIVITY_SINGLE_TOP，与微信自己发
+     * LoginSelectUI intent 时用的标志一致），两者都加。
      * 缓存快速通道与 DexKit 路径都调它，缓存格式不动（每次启动现解析）。
      * 解析失败只记日志，绝不影响已有的 ok.C、checkloginaspad、R 钩子。
      */
-    private fun hookJumpRedirect(classLoader: ClassLoader): Boolean {
+    private fun hookPasswordFirstRedirect(classLoader: ClassLoader): Boolean {
         try {
-            val clazz = Class.forName(JUMP_CLASS, false, classLoader)
+            val clazz = Class.forName(PASSWORD_CLASS, false, classLoader)
             val method = clazz.declaredMethods.firstOrNull { candidate ->
-                candidate.name == JUMP_METHOD &&
+                candidate.name == PASSWORD_METHOD &&
                     candidate.parameterTypes.map { it.name } ==
-                    listOf(Context::class.java.name)
-            } ?: error("冷启动改道方法未找到：$JUMP_CLASS.$JUMP_METHOD")
+                    listOf(Bundle::class.java.name)
+            } ?: error("密码屏改道方法未找到：$PASSWORD_CLASS.$PASSWORD_METHOD")
             check(method.returnType.name == HookUtils.VOID_TYPE) {
-                "冷启动改道方法返回类型已变化"
+                "密码屏改道方法返回类型已变化"
             }
             method.isAccessible = true
             xposed.hook(method)
-                .setId(JUMP_HOOK_ID)
+                .setId(PASSWORD_HOOK_ID)
                 .intercept(object : XposedInterface.Hooker {
                     override fun intercept(
                         chain: XposedInterface.Chain
                     ): Any? {
+                        val result = chain.proceed()
                         try {
-                            val context = chain.getArg(0) as Context
-                            val intent = Intent().apply {
-                                setClassName(context, LOGIN_SELECT_CLASS)
-                                putExtra(EXTRA_PURPOSE, 1)
-                                addFlags(
-                                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                                        FLAG_ACTIVITY_SINGLE_TOP
+                            if (!passwordRedirectDone) {
+                                passwordRedirectDone = true
+                                val activity = chain.getThis() as Activity
+                                val intent = Intent().apply {
+                                    setClassName(activity, LOGIN_SELECT_CLASS)
+                                    putExtra(EXTRA_PURPOSE, 1)
+                                    addFlags(
+                                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                                            FLAG_ACTIVITY_SINGLE_TOP
+                                    )
+                                }
+                                activity.startActivity(intent)
+                                activity.finish()
+                                HookUtils.logi(
+                                    "wechat password redirected to LoginSelectUI"
                                 )
                             }
-                            context.startActivity(intent)
-                            HookUtils.logi(
-                                "wechat jump redirected to LoginSelectUI"
-                            )
-                            return null
                         } catch (throwable: Throwable) {
                             HookUtils.logi(
-                                "wechat jump redirect FAILED: " +
+                                "wechat password redirect FAILED: " +
                                     "${throwable.message}"
                             )
-                            return chain.proceed()
                         }
+                        return result
                     }
                 })
-            HookUtils.logi("wechat jump hook installed")
+            HookUtils.logi("wechat password hook installed")
             return true
         } catch (throwable: Throwable) {
-            HookUtils.logi("wechat jump hook FAILED: ${throwable.message}")
+            HookUtils.logi("wechat password hook FAILED: ${throwable.message}")
             xposed.log(
                 Log.WARN,
                 HookUtils.TAG,
-                "微信冷启动改道钩子失败（不影响已有钩子）",
+                "微信密码屏改道钩子失败（不影响已有钩子）",
                 throwable
             )
             return false
@@ -357,9 +358,13 @@ internal class WeChatHook(
         private const val FOLD_WHITELIST_CLASS = "com.tencent.mm.ui.ok"
         private const val FOLD_WHITELIST_METHOD = "R"
         private const val FOLD_WHITELIST_HOOK_ID = "wechat_fold_whitelist"
-        private const val JUMP_CLASS = "com.tencent.mm.ui.LauncherUI"
-        private const val JUMP_METHOD = "jumpToLogin"
-        private const val JUMP_HOOK_ID = "wechat_jump_to_login"
+        private const val PASSWORD_CLASS =
+            "com.tencent.mm.plugin.account.ui.LoginPasswordUI"
+        private const val PASSWORD_METHOD = "onCreate"
+        private const val PASSWORD_HOOK_ID = "wechat_password_first_redirect"
+
+        // 进程内静态标志：密码屏首次创建才改道，后续创建不再改道，避免循环。
+        private var passwordRedirectDone = false
 
         private const val CACHE_FILE_NAME = "tablethook_wechat_cache.json"
         private const val KEY_ENV = "env"
