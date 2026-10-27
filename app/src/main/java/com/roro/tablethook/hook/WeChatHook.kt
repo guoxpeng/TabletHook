@@ -215,14 +215,21 @@ internal class WeChatHook(
     private fun hookFoldWhitelist(classLoader: ClassLoader): Boolean {
         return try {
             val cls = Class.forName(FOLD_WHITELIST_CLASS, false, classLoader)
-            val method = cls.declaredMethods.firstOrNull { candidate ->
-                candidate.name == FOLD_WHITELIST_METHOD && candidate.parameterTypes.isEmpty()
-            } ?: error("折叠屏白名单方法未找到：$FOLD_WHITELIST_CLASS.$FOLD_WHITELIST_METHOD")
-            check(Modifier.isPublic(method.modifiers) && Modifier.isStatic(method.modifiers)) {
-                "折叠屏白名单方法不是公开静态方法"
+            // 用 filter 而不是 firstOrNull：`com.tencent.mm.ui.ok` 里若同时存在
+            // `R()` 和其它同名重载，firstOrNull 会按声明顺序随便挑一个，挑错就
+            // check 失败、白名单永久装不上（而且只是 WARN 级别）。
+            val candidates = cls.declaredMethods.filter { candidate ->
+                candidate.name == FOLD_WHITELIST_METHOD &&
+                    candidate.parameterTypes.isEmpty() &&
+                    Modifier.isStatic(candidate.modifiers) &&
+                    candidate.returnType.name == HookUtils.BOOLEAN_TYPE
             }
-            check(method.returnType.name == HookUtils.BOOLEAN_TYPE) {
-                "折叠屏白名单返回类型已变化"
+            check(candidates.size == 1) {
+                "折叠屏白名单候选异常：$FOLD_WHITELIST_CLASS.$FOLD_WHITELIST_METHOD 命中 ${candidates.size} 个"
+            }
+            val method = candidates.single()
+            check(Modifier.isPublic(method.modifiers)) {
+                "折叠屏白名单方法不是公开静态方法"
             }
             hookBooleanMethod(method, FOLD_WHITELIST_HOOK_ID)
             HookUtils.logi("wechat R hook installed")
@@ -251,8 +258,7 @@ internal class WeChatHook(
             check(method.returnType.name == HookUtils.VOID_TYPE) { "密码屏改道方法返回类型已变化" }
 
             method.isAccessible = true
-            xposed.hook(method)
-                .setId(PASSWORD_HOOK_ID)
+            HookUtils.safeHook(xposed, method, PASSWORD_HOOK_ID)
                 .intercept { chain ->
                     HookUtils.logi("wechat password intercept fired")
                     val result = chain.proceed()

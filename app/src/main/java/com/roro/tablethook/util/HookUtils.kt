@@ -3,6 +3,7 @@ package com.roro.tablethook.util
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import java.io.File
+import java.lang.reflect.Executable
 import java.lang.reflect.Method
 
 internal object HookUtils {
@@ -20,18 +21,42 @@ internal object HookUtils {
     val BOOLEAN_TYPE: String = Boolean::class.javaPrimitiveType!!.name
     val VOID_TYPE: String = Void.TYPE.name
 
+    /** DexKit native 库是否已经加载过：DexKit 可能被重试调用，`System.load` 同一库重复加载会抛异常。 */
+    @Volatile
+    private var dexKitLoaded = false
+
+    /**
+     * 加载 DexKit 的 native 库。
+     *
+     * 优先用模块目录下的绝对路径（依赖 `extractNativeLibs=true` / `useLegacyPackaging=true`）；
+     * 拿不到文件时退回 `System.loadLibrary`，走系统从 APK 内映射的路径。
+     *
+     * 这样 `extractNativeLibs` 哪天被改掉也不会让微信侧静默全崩——QQ 侧本来就不用 DexKit，
+     * 只有微信受影响，而这种崩溃表现是「模块启用了但微信完全没反应」，很难归因。
+     */
     fun loadDexKitLibrary(nativeLibraryDir: String?) {
-        check(!nativeLibraryDir.isNullOrEmpty()) {
-            "无法获取模块 native library 目录"
+        if (dexKitLoaded) {
+            return
         }
-        val dexKitLibrary = File(
-            nativeLibraryDir,
-            System.mapLibraryName(DEXKIT_LIBRARY)
-        )
-        check(dexKitLibrary.isFile) {
-            "DexKit native library 不存在：${dexKitLibrary.absolutePath}"
+        synchronized(this) {
+            if (dexKitLoaded) {
+                return
+            }
+            val libName = System.mapLibraryName(DEXKIT_LIBRARY)
+            if (!nativeLibraryDir.isNullOrEmpty()) {
+                val file = File(nativeLibraryDir, libName)
+                if (file.isFile) {
+                    System.load(file.absolutePath)
+                    dexKitLoaded = true
+                    return
+                }
+                logi("dexkit 绝对路径不存在（$nativeLibraryDir），尝试 loadLibrary")
+            }
+            // 兜底：extractNativeLibs=false 时 nativeLibraryDir 里没有实体文件，
+            // 但系统仍能从 APK 直接映射。
+            System.loadLibrary(DEXKIT_LIBRARY)
+            dexKitLoaded = true
         }
-        System.load(dexKitLibrary.absolutePath)
     }
 
     /**
@@ -68,10 +93,27 @@ internal object HookUtils {
         }
     }
 
+    /**
+     * 统一的安全 hook 入口。
+     *
+     * 所有 hook 一律带 `ExceptionMode.PROTECTIVE`：模块是注入到宿主进程里的，
+     * 我们自己抛出的异常绝不能让宿主崩溃（否则表现是「装了模块，微信/QQ 偶尔闪退」，
+     * 极难归因）。
+     *
+     * 注意它只能保证「不崩」，不能保证语义正确 —— 拦截体内部仍必须各自给出
+     * 合理的兜底返回值。
+     */
+    fun safeHook(
+        xposed: XposedInterface,
+        executable: Executable,
+        hookId: String
+    ): XposedInterface.HookBuilder = xposed.hook(executable)
+        .setId(hookId)
+        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+
     fun hookBooleanMethod(xposed: XposedInterface, method: Method, hookId: String) {
         method.isAccessible = true
-        xposed.hook(method)
-            .setId(hookId)
+        safeHook(xposed, method, hookId)
             .intercept { true }
     }
 

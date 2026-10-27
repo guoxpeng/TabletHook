@@ -83,7 +83,15 @@ internal class QqHook(
     private val constCred = PadCred(PAD_APP_ID, PAD_KEY, SRC_CONST)
 
     /** 启动时拿到的 app loader，用于在没有 Application 的进程里反射读 manifest。 */
+    @Volatile
     private var appLoader: ClassLoader? = null
+
+    /** `AppSetting` 类对象，供延迟补初始化时反射调用。 */
+    @Volatile
+    private var appSettingClass: Class<*>? = null
+
+    /** 是否已经补过一次原生 `AppSetting` 初始化。 */
+    private val nativePrimed = AtomicBoolean(false)
 
     /** 幂等标记：同一进程的重复 `install` 回调只做第一次。 */
     private val bootstrapped = AtomicBoolean(false)
@@ -161,8 +169,7 @@ internal class QqHook(
         for (ctor in cls.declaredConstructors) {
             val ok = runCatching {
                 ctor.isAccessible = true
-                xposed.hook(ctor)
-                    .setId(DELEGATE_LOADER_HOOK_ID)
+                HookUtils.safeHook(xposed, ctor, DELEGATE_LOADER_HOOK_ID)
                     .intercept { chain ->
                         val result = chain.proceed()
                         runCatching {
@@ -181,7 +188,16 @@ internal class QqHook(
             Class.forName(CLS_APP_SETTING, false, loader)
         }.getOrNull()
         if (appSetting == null) {
-            HookUtils.ruleFailure(RULE_APP_SETTING, CLS_APP_SETTING, "TARGET_CLASS_MISSING", processName)
+            // QQ 会为各种插件创建多个 loader，绝大多数里面没有 AppSetting。
+            // 只在首次记录失败，避免 `[dlcl]` 每次都刷一条（真正的失败信息已经进 summary）。
+            if (probedKeys.add("$RULE_APP_SETTING@missing@$processName")) {
+                HookUtils.ruleFailure(
+                    RULE_APP_SETTING,
+                    CLS_APP_SETTING,
+                    "TARGET_CLASS_MISSING（该 loader 不含业务类，属正常）",
+                    processName
+                )
+            }
             markFailed(RULE_APP_SETTING)
             return
         }
@@ -201,6 +217,7 @@ internal class QqHook(
     // ---------------- AppSetting ----------------
 
     private fun hookAppSetting(appSetting: Class<*>, tag: String) {
+        appSettingClass = appSetting
         probeAppSettingFields(appSetting, tag)
 
         val statics = appSetting.declaredMethods.filter { method ->
@@ -252,8 +269,7 @@ internal class QqHook(
         )?.let { method ->
             runCatching {
                 method.isAccessible = true
-                xposed.hook(method)
-                    .setId(RULE_APP_SETTING_FLAG)
+                HookUtils.safeHook(xposed, method, RULE_APP_SETTING_FLAG)
                     .intercept {
                         // 不再执行原生实现：原生 o() 只是 `PadUtil.a(ctx) == TABLET`，
                         // 而 PadUtil.a() 已被我们改成 TABLET，结论恒为 true；直接给结果
@@ -269,6 +285,41 @@ internal class QqHook(
     }
 
     /**
+     * 主动触发一次原生 `AppSetting.a()` 链上的初始化。
+     *
+     * 原生 `a()` 只做一件事：确保 `u()` 执行过一次。而 `u()` 除了把 manifest 的平板
+     * 凭证覆盖到 `g/j`、手机凭证覆盖到 `f/i`，还会把 manifest 的版本段拼进静态字段
+     * `o`（客户端版本串 `9.3.75.42350.2026-10-13.<hash>`）。
+     *
+     * 我们从 2.4.2 起不再 `chain.proceed()`，`e()` / `i()` 里原本那句 `a()` 也就没了。
+     * 现实中不会出问题——`c()` / `d()` / `g()` / `h()` 每个都以 `a()` 开头，QQ 启动
+     * 必然调用其中之一（版本号上报）。但这条依赖是隐式的：万一某个进程只碰 `e()`/`i()`，
+     * `u()` 就永不执行，`o` 会缺最后一段。
+     *
+     * 这里调一次 `c()`（public static String，第一行就是 `a()`），把「依赖 QQ 的调用
+     * 顺序」变成「我们主动保证」。同时把返回的版本串记进日志，顺带成为 `o` 是否完整的探针。
+     */
+    private fun primeNativeAppSetting(appSetting: Class<*>, tag: String) {
+        // 关键前置：原生 `u()` 里 `BaseApplication.getContext()` 若为 null 会抛 NPE，
+        // 而它内部 catch 掉之后 `a()` 仍会把 D 置为 true —— 等于永久放弃初始化。
+        // 所以 Context 没就绪时宁可不碰，交给 QQ 自己在合适的时机调用。
+        if (appContext() == null) {
+            log("[$tag] 跳过主动初始化：Context 尚未就绪，交给 QQ 自己触发")
+            return
+        }
+        val version = runCatching {
+            appSetting.getMethod("c").invoke(null) as? String
+        }.getOrNull()
+        if (version.isNullOrEmpty()) {
+            log("[$tag] 原生 AppSetting.c() 未取到版本串（e()/i() 已被接管，通常无影响）")
+        } else if (version.endsWith(".")) {
+            log("[$tag] 原生版本串疑似缺末段（可能 u() 未生效）：$version")
+        } else {
+            log("[$tag] 原生版本串已初始化：$version")
+        }
+    }
+
+    /**
      * 接管 `AppSetting.e()`，返回平板 appid。
      *
      * 取值来自 [padCredential]（manifest 优先、常量兜底），与 [hookPadKey] 用的是**同一份**
@@ -280,8 +331,7 @@ internal class QqHook(
     private fun hookPadAppId(method: Method, tag: String): Boolean {
         return runCatching {
             method.isAccessible = true
-            xposed.hook(method)
-                .setId(RULE_APP_SETTING_APPID)
+            HookUtils.safeHook(xposed, method, RULE_APP_SETTING_APPID)
                 .intercept {
                     runCatching {
                         val cred = padCredential()
@@ -312,8 +362,7 @@ internal class QqHook(
     private fun hookPadKey(method: Method, tag: String): Boolean {
         return runCatching {
             method.isAccessible = true
-            xposed.hook(method)
-                .setId(RULE_APP_SETTING_KEY)
+            HookUtils.safeHook(xposed, method, RULE_APP_SETTING_KEY)
                 .intercept {
                     runCatching {
                         val cred = padCredential()
@@ -385,6 +434,11 @@ internal class QqHook(
         )
         if (fromManifest == null) {
             log("PAD_CRED 读取 manifest 失败，本次退回编译期常量（$PAD_APP_ID），稍后自动重试")
+        } else if (nativePrimed.compareAndSet(false, true)) {
+            // 走到这里说明 Context 一定可用（刚用它读过 PackageManager），
+            // 是补原生初始化最安全的时机。放在 onPackageReady 里做不了：
+            // 实测那个阶段 ActivityThread.currentApplication() 还是 null。
+            appSettingClass?.let { primeNativeAppSetting(it, "cred") }
         }
         return cred
     }
@@ -551,8 +605,7 @@ internal class QqHook(
         }
         runCatching {
             method.isAccessible = true
-            xposed.hook(method)
-                .setId(RULE_PAD_UTIL)
+            HookUtils.safeHook(xposed, method, RULE_PAD_UTIL)
                 .intercept { tablet }
             HookUtils.ruleInstalled(RULE_PAD_UTIL, 1, processName)
             markInstalled(RULE_PAD_UTIL)
@@ -597,8 +650,7 @@ internal class QqHook(
         }
         runCatching {
             method.isAccessible = true
-            xposed.hook(method)
-                .setId(RULE_MULTI_DEVICE_PAD)
+            HookUtils.safeHook(xposed, method, RULE_MULTI_DEVICE_PAD)
                 .intercept { true }
             HookUtils.ruleInstalled(RULE_MULTI_DEVICE_PAD, 1, processName)
             markInstalled(RULE_MULTI_DEVICE_PAD)
@@ -666,8 +718,7 @@ internal class QqHook(
         }
         runCatching {
             method.isAccessible = true
-            xposed.hook(method)
-                .setId(RULE_SESSION_INIT)
+            HookUtils.safeHook(xposed, method, RULE_SESSION_INIT)
                 .intercept { chain ->
                     val config = chain.getArg(0)
                     if (config != null) {
@@ -790,8 +841,7 @@ internal class QqHook(
         }
         runCatching {
             method.isAccessible = true
-            xposed.hook(method)
-                .setId(RULE_ONLINE_DEVICES)
+            HookUtils.safeHook(xposed, method, RULE_ONLINE_DEVICES)
                 .intercept { chain ->
                     val result = chain.proceed()
                     runCatching { dumpOnlineDevices(chain.getArg(0)) }
