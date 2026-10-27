@@ -35,6 +35,18 @@ class QqPadEntry : XposedModule() {
 
     private val wechatInstalled = AtomicBoolean(false)
 
+    /**
+     * 进程内唯一的 QQ hook 实例。
+     *
+     * QQ 的 `onPackageReady` 会在同一进程里回调多次（实测一次运行里出现过两次，
+     * 每次 `isFirstPackage` 都是 true）。如果每次都 `QqHook(this)` 新建实例，
+     * 实例级的 `installedLoaders` / `delegateLoaderHooked` 去重全部失效：
+     * DelegateLastClassLoader 的 5 个构造器会被叠着 hook 两遍、三遍，
+     * 之后每次创建 loader 都触发多轮 `installOn`，hook 层数随回调次数线性增长。
+     */
+    @Volatile
+    private var qqHook: QqHook? = null
+
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         val processName = param.processName
         targetProcessName = when {
@@ -75,7 +87,11 @@ class QqPadEntry : XposedModule() {
             // 这样 QQ 进程里不会加载模块目录下的 libdexkit.so，
             // /proc/self/maps 也就少一条模块路径痕迹。
             if (QqHook.isTargetProcess(processName)) {
-                QqHook(this).install(param.classLoader, processName, appDataDir)
+                // 复用同一实例：重复回调只是幂等重入，不会再叠一层 hook。
+                val hook = qqHook ?: synchronized(this) {
+                    qqHook ?: QqHook(this).also { qqHook = it }
+                }
+                hook.install(param.classLoader, processName, appDataDir)
                 return
             }
 

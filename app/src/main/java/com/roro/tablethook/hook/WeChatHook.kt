@@ -141,6 +141,14 @@ internal class WeChatHook(
         try {
             val json = JSONObject(cacheFile.readText())
 
+            // 版本校验：类名和签名都没变、但方法语义变了的情况（升级后同名方法不再是
+            // 「是否平板环境」），靠签名校验查不出来，只能靠版本号把缓存整体作废。
+            val cachedVersion = json.optString(KEY_VERSION, "")
+            val liveVersion = currentVersion()
+            if (cachedVersion.isNotEmpty() && liveVersion != null && cachedVersion != liveVersion) {
+                error("微信版本已变化，缓存作废：$cachedVersion -> $liveVersion")
+            }
+
             val env = resolveCachedMethod(classLoader, json.getJSONObject(KEY_ENV))
             check(
                 Modifier.isPublic(env.modifiers) && Modifier.isStatic(env.modifiers)
@@ -173,6 +181,15 @@ internal class WeChatHook(
             hookFoldWhitelist(classLoader)
             hookPasswordFirstRedirect(classLoader)
             xposed.log(Log.INFO, HookUtils.TAG, "微信平板登录模式已启用（缓存）")
+
+            // 老版本写下的缓存没有 version 字段，不补写的话版本校验永远不生效。
+            if (cachedVersion.isEmpty() && liveVersion != null) {
+                runCatching {
+                    json.put(KEY_VERSION, liveVersion)
+                    cacheFile.writeText(json.toString())
+                    HookUtils.logi("wechat cache 补写版本号 $liveVersion")
+                }
+            }
             return true
         } catch (throwable: Throwable) {
             HookUtils.logi("wechat cache invalid: ${throwable.message}")
@@ -289,6 +306,7 @@ internal class WeChatHook(
         val json = JSONObject()
             .put(KEY_ENV, methodJson(env))
             .put(KEY_ELIG, methodJson(eligibility))
+        currentVersion()?.let { json.put(KEY_VERSION, it) }
         val target = File(dir, CACHE_FILE_NAME)
         val temp = File(dir, "$CACHE_FILE_NAME.tmp")
         temp.writeText(json.toString())
@@ -297,6 +315,15 @@ internal class WeChatHook(
             temp.delete()
         }
     }
+
+    /** 当前微信版本号，写进缓存用于失效判断；拿不到就返回 null（下次跳过校验）。 */
+    @Suppress("DEPRECATION")
+    private fun currentVersion(): String? = runCatching {
+        val app = Class.forName("android.app.ActivityThread")
+            .getMethod("currentApplication")
+            .invoke(null) as? Context ?: return@runCatching null
+        app.packageManager.getPackageInfo(PACKAGE_NAME, 0).versionName
+    }.getOrNull()
 
     private fun methodJson(method: Method): JSONObject = JSONObject()
         .put(KEY_CLASS, method.declaringClass.name)
@@ -346,6 +373,7 @@ internal class WeChatHook(
         private var passwordRedirectDone = false
 
         private const val CACHE_FILE_NAME = "tablethook_wechat_cache.json"
+        private const val KEY_VERSION = "version"
         private const val KEY_ENV = "env"
         private const val KEY_ELIG = "elig"
         private const val KEY_CLASS = "class"

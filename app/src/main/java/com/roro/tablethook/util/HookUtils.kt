@@ -14,6 +14,9 @@ internal object HookUtils {
     /** 落盘日志文件名，位于目标应用私有目录 files/ 下。 */
     private const val TRACE_FILE = "tablethook_trace.log"
 
+    /** 落盘日志大小上限，超过后截断重建。 */
+    private const val TRACE_MAX_BYTES = 1L * 1024 * 1024
+
     val BOOLEAN_TYPE: String = Boolean::class.javaPrimitiveType!!.name
     val VOID_TYPE: String = Void.TYPE.name
 
@@ -45,6 +48,8 @@ internal object HookUtils {
      * 把一行诊断信息追加到目标应用私有目录的 `files/tablethook_trace.log`。
      *
      * 拿不到 dataDir 时静默跳过；写失败不影响任何 Hook 逻辑。
+     * 超过 [TRACE_MAX_BYTES] 会截断重写：主进程和 `:MSF` 会同时往这个文件追加，
+     * 长期不封顶会一直涨，且多进程并发 append 越大越容易出现半行交错。
      */
     fun trace(appDataDir: String?, line: String) {
         if (appDataDir.isNullOrEmpty()) {
@@ -55,7 +60,11 @@ internal object HookUtils {
             if (!dir.isDirectory) {
                 dir.mkdirs()
             }
-            File(dir, TRACE_FILE).appendText(line + "\n")
+            val file = File(dir, TRACE_FILE)
+            if (file.length() > TRACE_MAX_BYTES) {
+                file.writeText("=== trace 超过上限，已截断重建 ===\n")
+            }
+            file.appendText(line + "\n")
         }
     }
 

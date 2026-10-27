@@ -14,8 +14,8 @@ android {
         applicationId = "com.roro.tablethook"
         minSdk = 30
         targetSdk = 37
-        versionCode = 26
-        versionName = "2.4.2-manifest"
+        versionCode = 27
+        versionName = "2.5-idempotent"
     }
 
     buildTypes {

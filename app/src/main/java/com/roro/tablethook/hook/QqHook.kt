@@ -3,6 +3,7 @@ package com.roro.tablethook.hook
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import com.roro.tablethook.config.ModuleConfig
@@ -41,7 +42,6 @@ internal class QqHook(
     private val installedLoaders: MutableSet<ClassLoader> =
         Collections.newSetFromMap(WeakHashMap<ClassLoader, Boolean>())
     private val delegateLoaderHooked = AtomicBoolean(false)
-    private val sessionLogged = AtomicBoolean(false)
 
     private var processName: String = PACKAGE_NAME
     private var appDataDir: String? = null
@@ -50,6 +50,9 @@ internal class QqHook(
     private val failedRules = linkedSetOf<String>()
     private val probedKeys: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
+    /** 会话配置 dump 的 stage 去重（before / after 各自一次）。 */
+    private val dumpedStages: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
     /** `PadUtil.a()` 的 hook 是否装上，仅用于诊断输出，不参与取值决策。 */
     private val padUtilHooked = AtomicBoolean(false)
 
@@ -57,23 +60,51 @@ internal class QqHook(
     data class PadCred(val appId: Int, val key: String, val source: String)
 
     /**
-     * 本次进程使用的平板凭证，**永远是同一组配对值**。
+     * 已经成功解析到的 manifest 平板凭证。
      *
-     * 来源优先级：
-     * 1. QQ 自己的 AndroidManifest `AppSetting_params_pad`。原生 `e()`/`i()` 的平板分支
-     *    就是从这里取值——`AppSetting.u()` 会把它覆盖到静态字段 g / j 上，所以 manifest
-     *    才是唯一真源：天然版本无关，且 appid 与 key 必然配对。
-     * 2. 读不到时退回编译期常量 [PAD_APP_ID] / [PAD_KEY]（9.3.75 实测值，与 manifest 一致）。
+     * **只有真值才写进来**。读 manifest 失败时不会把 const 兜底值永久锁死，
+     * 下次调用还会重试（5 秒节流）。
      *
-     * 历史教训：2.4.1 用「分别跟随原生」的方式取这两个值，两侧判据还不同（一个 `Int>0`、
-     * 一个非空串），一旦 QQ 换平板 appid，就可能 appid 走旧常量、key 走新原生值，
-     * 形成错配签名 → wtlogin 校验失败被踢。改成同源单点解析后不存在这种分裂。
+     * 历史教训：这一份原本是 `by lazy { resolvePadCredential() }`。`e()` 首次被调用
+     * 的时机可能早于 Application 就绪（`:MSF` 进程尤其明显），那次拿不到 Context
+     * 就退回编译期常量，而 `lazy` 会把这个结果**永久缓存**——之后 Context 就绪了
+     * 也再不会去看 manifest。表现就是「装上当天正常，某天 QQ 一升级就静默降级」。
      */
-    private val padCredential: PadCred by lazy { resolvePadCredential() }
+    @Volatile
+    private var cachedManifestCred: PadCred? = null
+
+    /** 下次允许重试解析 manifest 的时间点（`SystemClock.elapsedRealtime`）。 */
+    @Volatile
+    private var nextCredentialRetryAt = 0L
+
+    private val credentialLock = Any()
+
+    /** 编译期常量兜底凭证，与 QQ 9.3.75 manifest 平板项一致。 */
+    private val constCred = PadCred(PAD_APP_ID, PAD_KEY, SRC_CONST)
+
+    /** 启动时拿到的 app loader，用于在没有 Application 的进程里反射读 manifest。 */
+    private var appLoader: ClassLoader? = null
+
+    /** 幂等标记：同一进程的重复 `install` 回调只做第一次。 */
+    private val bootstrapped = AtomicBoolean(false)
 
     fun install(classLoader: ClassLoader, processName: String, appDataDir: String?) {
+        // 先落这两个字段，后面的日志才有地方可写。
         this.processName = processName
         this.appDataDir = appDataDir
+        if (!bootstrapped.compareAndSet(false, true)) {
+            // 重复回调：不再重复 hook DLCL 构造器、也不再重打汇总，
+            // 但如果给的是另一个 loader，仍要补装（installOn 内部按 loader 去重），
+            // 否则第二次回调带来的那个「更正确」的 loader 会漏装。
+            if (classLoader !== appLoader) {
+                log("[reentry] 重复 install 回调，补装到新 loader：${classLoader.javaClass.name}")
+                installOn(classLoader, "reentry")
+            } else {
+                log("[skip] 重复 install 回调，同一 loader 已装过，忽略")
+            }
+            return
+        }
+        this.appLoader = classLoader
         if (ModuleConfig.LOG_DEVICE_PROFILE) {
             logDeviceProfile(processName)
         }
@@ -116,10 +147,19 @@ internal class QqHook(
         if (!delegateLoaderHooked.compareAndSet(false, true)) {
             return
         }
-        runCatching {
-            val cls = Class.forName("dalvik.system.DelegateLastClassLoader", false, null)
-            var count = 0
-            for (ctor in cls.declaredConstructors) {
+        val cls = runCatching {
+            Class.forName("dalvik.system.DelegateLastClassLoader", false, null)
+        }.getOrNull()
+        if (cls == null) {
+            log("DelegateLastClassLoader 不存在，跳过（低版本 or 非 ART）")
+            return
+        }
+        var count = 0
+        var failed = 0
+        // 逐个构造器单独兜异常：5 个里某一个（比如已废弃的那个）挂不上，
+        // 不能让其余 4 个跟着一起不装 —— 原来整个循环共用一个 runCatching。
+        for (ctor in cls.declaredConstructors) {
+            val ok = runCatching {
                 ctor.isAccessible = true
                 xposed.hook(ctor)
                     .setId(DELEGATE_LOADER_HOOK_ID)
@@ -130,10 +170,10 @@ internal class QqHook(
                         }
                         result
                     }
-                count++
-            }
-            log("DelegateLastClassLoader 构造器已 hook x$count")
-        }.onFailure { log("DelegateLastClassLoader hook 失败：$it") }
+            }.isSuccess
+            if (ok) count++ else failed++
+        }
+        log("DelegateLastClassLoader 构造器已 hook x$count（失败 $failed）")
     }
 
     private fun installOn(loader: ClassLoader, tag: String) {
@@ -168,9 +208,13 @@ internal class QqHook(
         }
 
         // e() -> 平板 appid：与 i() 同源取值，保证配对
-        val appIdMatches = statics.filter {
+        // 优先认无参版本；只有 QQ 改了签名（比如加了 Context 参数）才退回单参版本，
+        // 避免将来多出一个 e(int) 重载时把 no-arg 版本挤成 AMBIGUOUS 而整条规则失效。
+        val appIdCandidates = statics.filter {
             it.name == "e" && it.returnType == Int::class.javaPrimitiveType
         }
+        val appIdMatches = appIdCandidates.filter { it.parameterTypes.isEmpty() }
+            .ifEmpty { appIdCandidates }
         HookUtils.uniqueMatchOrNull(appIdMatches, RULE_APP_SETTING_APPID, "AppSetting.e()", processName)
             ?.let { method ->
                 if (hookPadAppId(method, tag)) {
@@ -180,9 +224,11 @@ internal class QqHook(
             ?: markFailed(RULE_APP_SETTING_APPID)
 
         // i() -> 平板 appid 对应的 key：与 e() 同一来源
-        val keyMatches = statics.filter {
+        val keyCandidates = statics.filter {
             it.name == "i" && it.returnType == String::class.java
         }
+        val keyMatches = keyCandidates.filter { it.parameterTypes.isEmpty() }
+            .ifEmpty { keyCandidates }
         HookUtils.uniqueMatchOrNull(keyMatches, RULE_APP_SETTING_KEY, "AppSetting.i()", processName)
             ?.let { method ->
                 if (hookPadKey(method, tag)) {
@@ -227,6 +273,9 @@ internal class QqHook(
      *
      * 取值来自 [padCredential]（manifest 优先、常量兜底），与 [hookPadKey] 用的是**同一份**
      * 凭证，所以 appid 与 key 永远配对。这里不再执行原生实现，高频调用下没有额外开销。
+     *
+     * 整个拦截体包在 runCatching 里：这是 QQ 每次取 appid 的必经之路，任何异常冒出去
+     * 都会直接打断调用方（可能崩在 QQ 自己的业务代码里）。宁可返回兜底常量并记一条日志。
      */
     private fun hookPadAppId(method: Method, tag: String): Boolean {
         return runCatching {
@@ -234,13 +283,21 @@ internal class QqHook(
             xposed.hook(method)
                 .setId(RULE_APP_SETTING_APPID)
                 .intercept {
-                    val cred = padCredential
-                    probeNativeValue(
-                        RULE_APP_SETTING_APPID,
-                        "e() source=${cred.source}",
+                    runCatching {
+                        val cred = padCredential()
+                        probeNativeValue(
+                            RULE_APP_SETTING_APPID,
+                            "e() source=${cred.source}",
+                            cred.appId
+                        )
                         cred.appId
-                    )
-                    cred.appId
+                    }.getOrElse { error ->
+                        logOnce(
+                            RULE_APP_SETTING_APPID,
+                            "[$tag] $RULE_APP_SETTING_APPID 取值异常，本次返回常量兜底：$error"
+                        )
+                        PAD_APP_ID
+                    }
                 }
             HookUtils.ruleInstalled(RULE_APP_SETTING_APPID, 1, processName)
             markInstalled(RULE_APP_SETTING_APPID)
@@ -258,13 +315,21 @@ internal class QqHook(
             xposed.hook(method)
                 .setId(RULE_APP_SETTING_KEY)
                 .intercept {
-                    val cred = padCredential
-                    probeNativeValue(
-                        RULE_APP_SETTING_KEY,
-                        "i() source=${cred.source}",
-                        maskKey(cred.key)
-                    )
-                    cred.key
+                    runCatching {
+                        val cred = padCredential()
+                        probeNativeValue(
+                            RULE_APP_SETTING_KEY,
+                            "i() source=${cred.source}",
+                            maskKey(cred.key)
+                        )
+                        cred.key
+                    }.getOrElse { error ->
+                        logOnce(
+                            RULE_APP_SETTING_KEY,
+                            "[$tag] $RULE_APP_SETTING_KEY 取值异常，本次返回常量兜底：$error"
+                        )
+                        PAD_KEY
+                    }
                 }
             HookUtils.ruleInstalled(RULE_APP_SETTING_KEY, 1, processName)
             markInstalled(RULE_APP_SETTING_KEY)
@@ -272,6 +337,35 @@ internal class QqHook(
         }.getOrElse {
             log("[$tag] $RULE_APP_SETTING_KEY hook 失败：$it")
             false
+        }
+    }
+
+    /**
+     * 取本次要用的平板凭证。
+     *
+     * 命中 manifest 真值就永久缓存；只有兜底结果时不缓存，隔一段时间重试——
+     * 因为读 manifest 依赖 Context，而 `e()` 可能早于 Application 就绪就被调用。
+     * 重试间隔 5 秒，避免高频 `e()` 路径上反复走 PackageManager。
+     */
+    private fun padCredential(): PadCred {
+        cachedManifestCred?.let { return it }
+        val now = SystemClock.elapsedRealtime()
+        if (now < nextCredentialRetryAt) {
+            return constCred
+        }
+        synchronized(credentialLock) {
+            cachedManifestCred?.let { return it }
+            if (now < nextCredentialRetryAt) {
+                return constCred
+            }
+            val resolved = resolvePadCredential()
+            return if (resolved.source == SRC_MANIFEST) {
+                cachedManifestCred = resolved
+                resolved
+            } else {
+                nextCredentialRetryAt = now + CREDENTIAL_RETRY_INTERVAL_MS
+                resolved
+            }
         }
     }
 
@@ -284,13 +378,13 @@ internal class QqHook(
      */
     private fun resolvePadCredential(): PadCred {
         val fromManifest = readManifestPadCredential()
-        val cred = fromManifest ?: PadCred(PAD_APP_ID, PAD_KEY, "const-fallback")
+        val cred = fromManifest ?: constCred
         log(
             "PAD_CRED source=${cred.source} appId=${cred.appId} key=${maskKey(cred.key)} " +
                 "padUtilHooked=${padUtilHooked.get()}"
         )
         if (fromManifest == null) {
-            log("PAD_CRED 读取 manifest 失败，已退回编译期常量（$PAD_APP_ID）；QQ 换过平板 appid 时需排查")
+            log("PAD_CRED 读取 manifest 失败，本次退回编译期常量（$PAD_APP_ID），稍后自动重试")
         }
         return cred
     }
@@ -308,24 +402,39 @@ internal class QqHook(
         val appId = parts.getOrNull(0)?.trim()?.toIntOrNull() ?: return@runCatching null
         val key = parts.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
             ?: return@runCatching null
-        PadCred(appId, key, "manifest")
+        PadCred(appId, key, SRC_MANIFEST)
     }.getOrNull()
 
     /**
      * QQ 进程里的 Context。
      *
      * `:MSF` 这类没有 Activity 的进程取不到 `ActivityThread.currentApplication()`，
-     * 退一步用 QQ 自己的 `BaseApplication.getContext()`。
+     * 依次退到：`currentActivityThread().getApplication()`、QQ 自己的
+     * `BaseApplication.getContext()`。
+     *
+     * 最后这条必须用 **app 的 loader** 去加载：`BaseApplication` 是 QQ 的类，
+     * 用模块自己的 loader 调 `Class.forName` 大概率是 ClassNotFound，那样等于没有兜底。
      */
-    private fun appContext(): Context? = runCatching {
-        Class.forName("android.app.ActivityThread")
-            .getMethod("currentApplication")
-            .invoke(null) as? Context
-    }.getOrNull() ?: runCatching {
-        Class.forName("com.tencent.qphone.base.util.BaseApplication")
-            .getMethod("getContext")
-            .invoke(null) as? Context
-    }.getOrNull()
+    private fun appContext(): Context? {
+        runCatching {
+            Class.forName("android.app.ActivityThread", false, null)
+                .getMethod("currentApplication")
+                .invoke(null) as? Context
+        }.getOrNull()?.let { return it }
+
+        runCatching {
+            val threadClass = Class.forName("android.app.ActivityThread", false, null)
+            val thread = threadClass.getMethod("currentActivityThread").invoke(null)
+            threadClass.getMethod("getApplication").invoke(thread) as? Context
+        }.getOrNull()?.let { return it }
+
+        return runCatching {
+            val loader = appLoader ?: return@runCatching null
+            Class.forName("com.tencent.qphone.base.util.BaseApplication", false, loader)
+                .getMethod("getContext")
+                .invoke(null) as? Context
+        }.getOrNull()
+    }
 
     /** key 打日志时脱敏，只留头尾确认「是不是同一串」。 */
     private fun maskKey(key: String): String =
@@ -336,9 +445,21 @@ internal class QqHook(
      *
      * 与 `AppSetting.e()` 共用同一份凭证，避免会话配置和 Java 层上报两个值打架。
      */
-    private fun currentPadAppId(): Int = padCredential.appId
+    private fun currentPadAppId(): Int = padCredential().appId
 
     // ---------------- 平板凭证探针（只读） ----------------
+
+    /**
+     * 同一个 key 在进程内只打一次日志。
+     *
+     * 用于 `e()` / `i()` 这类高频路径上的异常上报：既要留下证据，
+     * 又不能因为同一个异常被调用一千次就写一千行文件。
+     */
+    private fun logOnce(key: String, message: String) {
+        if (probedKeys.add("log:$key@$processName")) {
+            log(message)
+        }
+    }
 
     /**
      * 记录一次「取证结论」，每个规则 + 进程只记一次，避免高频方法刷屏。
@@ -514,6 +635,20 @@ internal class QqHook(
             enumConstant(Class.forName(CLS_NT_PLATFORM_TYPE, false, loader), "KANDROID")
         }.getOrNull()
 
+        // fail-closed：三个字段必须都能解析，否则整条规则不挂。
+        // 只改一半（appid 成了平板、deviceType 还是手机）比完全不改更难排查，
+        // 而且会让 Java 层与内核层对设备类型的认知互相矛盾。
+        if (pad == null || androidPlatform == null) {
+            HookUtils.ruleFailure(
+                RULE_SESSION_INIT,
+                "DeviceType.KPAD / PlatformType.KANDROID",
+                "ENUM_MISSING pad=${pad != null} platform=${androidPlatform != null}",
+                processName
+            )
+            markFailed(RULE_SESSION_INIT)
+            return
+        }
+
         val matches = proxy.declaredMethods.filter { method ->
             method.name == "init" &&
                 method.parameterTypes.size == 4 &&
@@ -535,15 +670,18 @@ internal class QqHook(
                 .setId(RULE_SESSION_INIT)
                 .intercept { chain ->
                     val config = chain.getArg(0)
-                    if (config != null && !ModuleConfig.QQ_DRY_RUN) {
+                    if (config != null) {
+                        // dump 放在 dry-run 判断之外：诊断模式下正是要看「本来报什么」。
                         if (ModuleConfig.LOG_QQ_SESSION) {
                             dumpSessionConfig(tag, config, "before")
                         }
-                        pad?.let { setField(config, "deviceType", it, tag) }
-                        setField(config, "appid", currentPadAppId().toString(), tag)
-                        androidPlatform?.let { setField(config, "platform", it, tag) }
-                        if (ModuleConfig.LOG_QQ_SESSION) {
-                            dumpSessionConfig(tag, config, "after")
+                        if (!ModuleConfig.QQ_DRY_RUN) {
+                            if (!overrideSessionConfig(config, pad, androidPlatform, tag)) {
+                                markFailed(RULE_SESSION_INIT)
+                            }
+                            if (ModuleConfig.LOG_QQ_SESSION) {
+                                dumpSessionConfig(tag, config, "after")
+                            }
                         }
                     }
                     chain.proceed()
@@ -555,6 +693,40 @@ internal class QqHook(
             log("[$tag] $RULE_SESSION_INIT hook 失败：$it")
             markFailed(RULE_SESSION_INIT)
         }
+    }
+
+    /**
+     * 把会话配置一次性改成平板，任一步失败就整体回滚。
+     *
+     * 三个字段里只要有一个写不进去，就把已经写过的恢复成原值——宁可这次会话按原生配置走，
+     * 也不要留下「appid 已是平板、deviceType 还是手机」这种内部矛盾状态。
+     */
+    private fun overrideSessionConfig(
+        config: Any,
+        pad: Any,
+        platform: Any,
+        tag: String
+    ): Boolean {
+        val snapshot = listOf(
+            "deviceType" to getField(config, "deviceType"),
+            "appid" to getField(config, "appid"),
+            "platform" to getField(config, "platform")
+        )
+        val ok = setField(config, "deviceType", pad, tag) &&
+            setField(config, "appid", currentPadAppId().toString(), tag) &&
+            setField(config, "platform", platform, tag)
+        if (!ok) {
+            for ((name, value) in snapshot) {
+                if (value != null) {
+                    setField(config, name, value, tag)
+                }
+            }
+            logOnce(
+                "$RULE_SESSION_INIT@rollback",
+                "[$tag] $RULE_SESSION_INIT 写入失败，已回滚为原生会话配置（不留半改状态）"
+            )
+        }
+        return ok
     }
 
     private fun dumpSessionConfig(tag: String, config: Any, stage: String) {
@@ -573,7 +745,10 @@ internal class QqHook(
                     .append(",osVer=").append(getField(deviceInfo, "osVer"))
                     .append('}')
             }
-            if (sessionLogged.compareAndSet(false, true)) {
+            // 按 stage 去重：before / after 各打一次。
+            // 原来共用一个 sessionLogged 标志，before 先把它置位，after 永远打不出来，
+            // 「对比改前改后」这个功能实际从未生效。
+            if (dumpedStages.add(stage)) {
                 log(builder.toString())
             }
         }
@@ -583,6 +758,8 @@ internal class QqHook(
 
     private fun hookRegisterProxy(loader: ClassLoader, tag: String) {
         if (!ModuleConfig.LOG_QQ_ONLINE_DEVICES) {
+            // 明确写一条：否则 summary 里 installed 少一条，看日志会误判成「这条规则失效了」。
+            log("[$tag] $RULE_ONLINE_DEVICES 已按配置关闭（LOG_QQ_ONLINE_DEVICES=false）")
             return
         }
         val handler = runCatching {
@@ -699,6 +876,13 @@ internal class QqHook(
         private const val PAD_APP_ID = 537397816
         private const val PAD_KEY = "0FFD632C4B7E08AF"
 
+        /** 凭证来源标记。 */
+        private const val SRC_MANIFEST = "manifest"
+        private const val SRC_CONST = "const-fallback"
+
+        /** manifest 读取失败后的重试间隔：`e()` 是高频路径，不能每次调用都走 PackageManager。 */
+        private const val CREDENTIAL_RETRY_INTERVAL_MS = 5_000L
+
         private const val CLS_APP_SETTING = "com.tencent.common.config.AppSetting"
         private const val CLS_PAD_UTIL = "com.tencent.common.config.pad.PadUtil"
         private const val CLS_PAD_DEVICE_TYPE = "com.tencent.common.config.pad.DeviceType"
@@ -753,22 +937,23 @@ internal class QqHook(
             return null
         }
 
-        private fun setField(target: Any, name: String, value: Any?, tag: String) {
+        private fun setField(target: Any, name: String, value: Any?, tag: String): Boolean {
             var cls: Class<*>? = target.javaClass
             while (cls != null) {
                 try {
                     val field: Field = cls.getDeclaredField(name)
                     field.isAccessible = true
                     field.set(target, value)
-                    return
+                    return true
                 } catch (_: NoSuchFieldException) {
                     cls = cls.superclass
                 } catch (throwable: Throwable) {
                     Log.w(HookUtils.TAG, "[$tag] 写入 $name 失败：$throwable")
-                    return
+                    return false
                 }
             }
             Log.w(HookUtils.TAG, "[$tag] 字段不存在：$name")
+            return false
         }
 
         private fun callGet(holder: Any?): Any? {

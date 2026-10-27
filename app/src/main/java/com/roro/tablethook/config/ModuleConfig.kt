@@ -30,7 +30,7 @@ internal object ModuleConfig {
     /**
      * 是否在 NT 会话初始化时 dump `InitSessionConfig`。
      *
-     * 每个进程只打一次（`sessionLogged` 保证），成本极低，是确认
+     * 每个进程打两条（改写前 / 改写后各一条），成本极低，是确认
      * 「上报给内核的 appid / deviceType 到底是什么」最直接的证据，保留。
      */
     const val LOG_QQ_SESSION = true

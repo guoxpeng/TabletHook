@@ -28,10 +28,27 @@
 
 | 应用 | 包名 | 最低版本 | versionCode | 真机验证版本 |
 | --- | --- | --- | ---: | --- |
-| 微信 | `com.tencent.mm` | `8.0.77` | `3141` | 8.0.77 |
+| 微信 | `com.tencent.mm` | `8.0.77` | `3141` | 8.0.79 |
 | QQ | `com.tencent.mobileqq` | `9.3.35` | `15560` | 9.3.75（`42350`） |
 
 ## 变更记录
+
+### 2.5-idempotent
+
+这一版不改变上报给服务端的任何数值（appid / key / deviceType 与 2.4.2 完全一致），只修「同一个正确的值可能因为时序或重复回调而变成错的」这一类结构性问题。
+
+- **重复 install 导致 hook 叠加**：QQ 的 `onPackageReady` 会在同一进程里回调多次（旧日志实测一次运行出现两次，两次 `isFirstPackage` 都是 true）。原来每次都 `QqHook(this)` 新建实例，实例级的 `installedLoaders` / `delegateLoaderHooked` 去重全部失效，`DelegateLastClassLoader` 的 5 个构造器被叠着 hook 多遍，之后每次创建 loader 都触发多轮 `installOn`。现在 `QqPadEntry` 持有进程内唯一实例，重复回调只对**新的** loader 补装。
+- **平板凭证不再被永久锁死**：原来 `padCredential` 是 `by lazy`。`e()` 首次被调用的时机可能早于 Application 就绪（`:MSF` 尤其明显），那次拿不到 Context 就退回编译期常量，而 `lazy` 会永久缓存这个结果——之后 Context 就绪了也不会再读 manifest。现在只缓存 manifest 真值，兜底结果 5 秒后自动重试。
+- **NT 会话配置改为「要么全改，要么全不改」**：原来 `KPAD` / `KANDROID` 枚举缺失时用 `?.let` 静默跳过，`setField` 失败只 `Log.w`，可能出现 appid 已是平板、`deviceType` 还是手机的内部矛盾状态。现在三个字段必须都能解析才挂规则，写入时任一步失败就把已写字段回滚成原值。
+- **`e()` / `i()` 拦截体加异常兜底**：这两个方法是 QQ 取 appid / key 的必经之路，任何异常冒出去都会打断调用方。现在异常时返回常量兜底并限流记一条日志。
+- **`appContext()` 补全兜底链路**：`BaseApplication` 是 QQ 的类，原来用模块自己的 classloader 去 `Class.forName` 大概率 ClassNotFound，等于没有兜底。现在改用 app 的 loader，并增加 `currentActivityThread().getApplication()` 这条路径。
+- **修复 `InitSessionConfig` 的 after 日志从来没打出来**：原来 before / after 共用一个 `sessionLogged` 标志，before 先置位，after 永远被吞。「对比改前改后」这个功能实际从未生效。
+- `QQ_DRY_RUN=true` 时也会 dump 会话配置（诊断模式下正是要看「本来报什么」）。
+- `AppSetting.e()` / `i()` 优先匹配**无参**版本，避免将来 QQ 增多一个重载时把 no-arg 版本挤成 `AMBIGUOUS_TARGET` 而整条规则失效。
+- `DelegateLastClassLoader` 的构造器改为逐个兜异常：某一个挂不上不再连累其余几个。
+- 微信定位缓存增加**版本号**校验：类名和签名都没变、但方法语义变了的情况靠签名查不出来，只能靠版本号让缓存整体作废。
+- 落盘日志加 1MB 上限（主进程与 `:MSF` 并发追加，长期不封顶会一直涨）。
+- 在线设备诊断规则被配置关闭时明确记一条日志，避免 `installed=6` 被误读成「有一条规则失效」。
 
 ### 2.4.2-manifest
 
@@ -131,3 +148,7 @@ app/src/main/java/com/roro/tablethook/
 ## 已知限制
 
 QQ 的多端在线按**平台大类**判定互斥：安卓手机和伪装成平板的安卓设备仍属同一大类，两台安卓端登录同一账号会被服务端互踢。本模块解决的是「客户端被识别为平板」，不改变服务端的平台互斥策略。跨平台组合（安卓 + PC、安卓 + iOS）不受此限制。
+
+`InitSessionConfig.deviceInfo` 里的机型信息（`devName` / `vendorName` / `osVer`）保持真实值，没有跟着 `deviceType=KPAD` 一起伪装成平板型号。刻意如此：改机型只会引入更多与真实硬件矛盾的字段，风险大于收益；但这也意味着「客户端类型是平板、设备名是真机型号」是本模块已知的可观测面。真机实测服务端接受该组合（在线设备列表 `client_type=7`）。
+
+微信侧 `inTabletEnv` 与副设备登录资格两个方法依赖 DexKit 动态定位，缓存按版本号失效；折叠屏白名单 `com.tencent.mm.ui.ok.R()` 与密码页 `LoginPasswordUI` 是固定类名，微信改这两处时只会丢对应辅助功能（折叠屏适配 / 密码页改道），不影响平板登录主链路，日志里会有 `wechat R hook FAILED` / `wechat password hook FAILED`。
