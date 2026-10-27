@@ -17,6 +17,18 @@ internal object ModuleConfig {
     const val HOOK_QQ_MAIN_PROCESS = true
 
     /**
+     * 是否把 QQ 进程内的设备画像对齐成真实平板（2.8-profile 新增）。
+     *
+     * 做法借自 I'm Pad：改写进程内 `Build.MODEL/BRAND/MANUFACTURER`、
+     * 让 `SystemProperties.get("ro.build.characteristics")` 返回 `tablet`、
+     * 并就地改写 QQ 的 `BUGLY_COMMON_VALUES.deviceModel` 缓存。
+     *
+     * **只影响 QQ 进程**：不写系统属性、不装 Magisk 模块、不动微信，
+     * QQ 进程退出后全部自动还原。关掉这个开关即回到 2.7 的纯 appid 方案。
+     */
+    const val ENABLE_QQ_DEVICE_PROFILE = true
+
+    /**
      * QQ NT 会话只诊断不改写。
      *
      * 排查期打开，可对比「QQ 本来报什么」与「改写后报什么」。

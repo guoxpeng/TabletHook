@@ -151,6 +151,13 @@ internal class QqHook(
         runCatching { installOn(classLoader, "app") }.onFailure {
             log("installOn(app) 阶段异常：$it")
         }
+        // 设备画像对齐：与上面 6 条规则完全解耦，单独兜异常。
+        // 它失败只会让「服务端看到的机型」仍是真机，不会影响已装好的 appid 改写。
+        runCatching {
+            QqDeviceProfile.install(xposed, processName, ::appContext, ::log)
+        }.onFailure {
+            log("[profile] 设备画像阶段异常：$it")
+        }
         runCatching { logSummary() }.onFailure {
             log("logSummary 阶段异常：$it")
         }
