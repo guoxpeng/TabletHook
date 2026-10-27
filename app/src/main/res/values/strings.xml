@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">TabletHook</string>
-    <string name="module_description">开启平板模式登录</string>
+    <string name="app_name">微Q平板模块</string>
+    <string name="module_description">微信 / QQ 平板模式登录</string>
 </resources>
