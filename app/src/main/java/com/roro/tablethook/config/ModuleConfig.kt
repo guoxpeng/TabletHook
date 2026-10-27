@@ -28,30 +28,40 @@ internal object ModuleConfig {
     const val LOG_DEVICE_PROFILE = true
 
     /**
-     * 是否输出 QQ 会话配置与在线设备列表的详细日志。
+     * 是否在 NT 会话初始化时 dump `InitSessionConfig`。
      *
-     * 含 appid / deviceType / 服务端在线设备条目，排查价值高，但可观测面也大。
+     * 每个进程只打一次（`sessionLogged` 保证），成本极低，是确认
+     * 「上报给内核的 appid / deviceType 到底是什么」最直接的证据，保留。
      */
     const val LOG_QQ_SESSION = true
 
     /**
-     * QQ 平板 appid 来源探针（只读）。
+     * 是否 dump 服务端下发的在线设备列表。
      *
-     * 打开后 `e()` / `i()` / `o()` 会各记一行「原生值 / 最终选择」，每个进程只记一次。
-     * 这是判断「跟随原生」是否真的生效的直接依据，平时留着也几乎不占日志。
+     * **默认关**。开启后会额外挂 `RegisterProxySvcPackHandler.e3`，
+     * 每次服务端推送都做反射 + 拼字符串 + 写 trace 文件，属于持续性 IO，
+     * 长时间开启会加重卡顿、也扩大可观测面。只在排查多设备互踢时临时打开。
+     */
+    const val LOG_QQ_ONLINE_DEVICES = false
+
+    /**
+     * QQ 平板凭证来源探针（只读）。
      *
-     * 探针在 QQ 9.3.75 上得出的结论（已固化为跟随逻辑）：
-     * 原生 `o()` 为真时，`e()` 自己给出平板 appid（537397816），`i()` 给出对应 key，
-     * 与写死值一致 —— 说明硬编码只在原生仍走手机分支时才需要兜底。
+     * 打开后 `e()` / `i()` / `o()` 会各记一行「凭证来源 / 实际取值」，每个进程只记一次。
+     * 正常留开也无所谓：只在首次调用时写一行。
      */
     const val PROBE_QQ_APP_ID = true
 
     /**
      * dump `AppSetting` 全部静态 int / String 字段。
      *
-     * 用于确认「手机 appid / 平板 appid / key」分别落在哪个字段上（9.3.75 为
-     * f=537397776 / g=537397237 / i=B0FAC20A724CCF50 / j=C5EF37EE8FAB3E09）。
-     * 一次输出几十个字段，只在排查时打开。
+     * 用于排查字段含义，一次输出几十个字段，只在需要时打开。
+     *
+     * 注意：9.3.75 的 dex 静态初始值是 f=537397776 / g=537397237 /
+     * i=B0FAC20A724CCF50 / j=C5EF37EE8FAB3E09，但运行时 `AppSetting.u()` 会用
+     * AndroidManifest 的 `AppSetting_params` / `AppSetting_params_pad` 覆盖它们，
+     * 覆盖后的真值是：手机 537397777 / FB28D5C4ADEAFA38，平板 537397816 / 0FFD632C4B7E08AF。
+     * 判断平板凭证请以 manifest 为准，不要看 dex 初始值。
      */
     const val PROBE_QQ_APP_SETTING_FIELDS = false
 }

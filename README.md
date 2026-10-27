@@ -33,7 +33,19 @@
 
 ## 变更记录
 
+### 2.4.2-manifest
+
+- **平板凭证改为从 AndroidManifest 单一来源解析**。`AppSetting.e()` / `i()` 现在共用同一份 `PadCred`（appid + key），取值优先读 QQ 自己的 `metaData["AppSetting_params_pad"]`，读不到才退回常量。
+- 依据：反编译 `AppSetting.u()` 可见，原生 `e() = o(ctx) ? g : f`、`i() = o(ctx) ? j : i`，而 `g/j` 正是被 `AppSetting_params_pad` 覆盖出来的。所以 manifest 就是原生平板分支的唯一真源，读它等价于读原生，且 appid 与 key 天然配对。
+- 修复 2.4.1 的**判据分裂**隐患：那一版 `e()` 用 `padFlag && native is Int && native > 0` 判断、`i()` 用 `padFlag && !native.isNullOrEmpty()` 判断，两侧是独立分支。旧日志中已实际出现过同一进程内 `e()` 走 `follow-native`、`i()` 走 `fallback` 的情况；只因当时常量恰好等于真值才没有出错。一旦 QQ 更换平板 appid，就会出现 appid 取新值、key 取旧常量的错配签名。
+- `e()` / `i()` 不再执行 `chain.proceed()`，`o()` 也直接返回 `true`。高频的 `i()`（被 `AppSetting.k()` 设备指纹调用）路径上零反射、零跨层调用。
+- 日志开关拆细：新增 `LOG_QQ_ONLINE_DEVICES`（默认关）。此前在线设备 dump 挂在服务端推送回调 `RegisterProxySvcPackHandler.e3` 上，每次推送都做反射 + 写文件，属于持续性 IO。`LOG_QQ_SESSION` 仅保留一次性的 `InitSessionConfig` 输出。
+- 新增启动日志 `PAD_CRED source=manifest|const-fallback appId=... key=脱敏 padUtilHooked=...`，一眼可看出这次用的是 manifest 真值还是常量兜底。
+- 修正文档中「dex 静态字段 `g=537397237` / `j=C5EF37EE8FAB3E09` 是平板值」的错误说法：那两个只是编译期占位符，运行时会被 manifest 覆盖成 `537397816` / `0FFD632C4B7E08AF`。
+
 ### 2.4.1-adaptive
+
+> 已被 2.4.2 取代：本版的「分别跟随原生」存在 appid / key 判据分裂风险，详见上一节。
 
 - **QQ 平板 appid 改为跟随原生**：`AppSetting.e()` / `i()` 不再无脑返回写死值，而是先取一次原生返回值。只要原生 `o()` 走过平板分支，就采用原生给出的 appid / key；只有原生仍判为手机时才回退到常量。
 - 意义：QQ 换代更换平板 appid 时，模块自动跟随，不会再出现「客户端自称平板、服务端不认」的**静默降级**。
@@ -83,7 +95,7 @@
 - 使用 `libxposed API 102` 接入 Xposed 生命周期和 Hook API。
 - **微信**：用 `DexKit 2.2.0` 按字符串（`inTabletEnv`、`/cgi-bin/micromsg-bin/checkloginaspad`）动态定位平板环境判定与副设备登录资格方法，不依赖固定混淆类名；定位结果带签名缓存。
 - **QQ**：直接用 QQ 9.3 系列稳定的固定类名（`com.tencent.common.config.AppSetting`、`com.tencent.common.config.pad.PadUtil`、`com.tencent.qqnt.kernel.nativeinterface.InitSessionConfig` 等），不引入 DexKit。
-- QQ 平板 appid / key **优先取 QQ 原生的返回值**（原生 `o()` 为真时其自身就会给出平板组合），代码里的 `537397816` / `0FFD632C4B7E08AF` 仅作原生仍走手机分支时的兜底。
+- QQ 平板 appid / key **从 AndroidManifest 的 `AppSetting_params_pad` 单一来源解析**（`appid#key#...`）。这正是 QQ 原生 `AppSetting.u()` 覆盖静态字段 `g` / `j` 的地方，所以等价于原生平板分支，且 appid 与 key 必然配对；读不到时才退回常量 `537397816` / `0FFD632C4B7E08AF`。
 - 对关键候选执行数量和签名校验，匹配异常时记录规则 ID 与原因，不使用不确定结果。
 
 动态定位只能降低版本变化带来的影响，不能保证所有后续版本自动兼容。目标应用更新后如出现匹配失败，需要结合日志重新分析。
