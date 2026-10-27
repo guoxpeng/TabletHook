@@ -66,14 +66,61 @@ class QqPadEntry : XposedModule() {
         HookUtils.logi("onModuleLoaded process=$processName matched=$targetProcessName")
     }
 
+    /**
+     * 本进程的进程名，带一条不依赖框架的兜底。
+     *
+     * `onModuleLoaded` 是进程名的唯一官方来源，但它只保证「模块加载时调一次」。
+     * 一旦它因为框架差异、时机或进程 fork 方式没走到，`targetProcessName` 就是 null，
+     * 而 `onPackageReady` 原来在写任何日志之前就 `return` 了 —— 那个进程会彻底静默，
+     * 事后既看不到 hook 失败、也看不到「跳过了」，排查时完全无迹可寻。
+     *
+     * `/proc/self/cmdline` 是内核给的当前进程命令行，对 `:MSF` 这种子进程同样准确，
+     * 且不依赖任何框架行为，适合当兜底。
+     */
+    private fun resolveProcessName(): String? {
+        targetProcessName?.let { return it }
+        val fromProc = runCatching {
+            java.io.File("/proc/self/cmdline").readText()
+                .substringBefore('\u0000')
+                .trim()
+        }.getOrNull()
+        if (fromProc.isNullOrEmpty()) {
+            return null
+        }
+        val matched = when {
+            fromProc == WeChatHook.PROCESS_NAME -> fromProc
+            QqHook.isTargetProcess(fromProc) -> fromProc
+            else -> null
+        }
+        HookUtils.logi(
+            "process name fallback via /proc/self/cmdline=$fromProc matched=$matched" +
+                "（onModuleLoaded 未提供进程名）"
+        )
+        targetProcessName = matched
+        return matched
+    }
+
     override fun onPackageReady(param: PackageReadyParam) {
-        val processName = targetProcessName ?: return
+        val appDataDir = param.applicationInfo.dataDir
+        // 日志前移到任何 return 之前：这个进程被跳过时也要留下可查的痕迹。
+        // 原顺序是先 return 后写日志，导致「模块启用了但某进程毫无动静」查不出原因。
+        val processName = resolveProcessName()
+        if (processName == null) {
+            HookUtils.trace(
+                appDataDir,
+                "entry SKIP package=${param.packageName} isFirst=${param.isFirstPackage} " +
+                    "原因：无法确定本进程名（既不匹配微信主进程，也不是 QQ 主进程/:MSF）"
+            )
+            HookUtils.logi(
+                "entry SKIP package=${param.packageName} dataDir=$appDataDir 原因：进程名未匹配"
+            )
+            return
+        }
         val expectedPackage = when {
             processName == WeChatHook.PROCESS_NAME -> WeChatHook.PACKAGE_NAME
             QqHook.isTargetProcess(processName) -> QqHook.PACKAGE_NAME
             else -> return
         }
-        val appDataDir = param.applicationInfo.dataDir
         HookUtils.trace(
             appDataDir,
             "entry process=$processName package=${param.packageName} " +

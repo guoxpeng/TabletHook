@@ -251,10 +251,17 @@ internal class WeChatHook(
     private fun hookPasswordFirstRedirect(classLoader: ClassLoader): Boolean {
         return try {
             val cls = Class.forName(PASSWORD_CLASS, false, classLoader)
-            val method = cls.declaredMethods.firstOrNull { candidate ->
+            // 与折叠屏白名单保持同一套判定：先 filter 再断言唯一，不要 firstOrNull。
+            // 微信同一个类里出现同名同参重载时（编译期 bridge / synthetic），
+            // firstOrNull 会按声明顺序随便挑，挑中就 hook 错方法，且不会报错。
+            val candidates = cls.declaredMethods.filter { candidate ->
                 candidate.name == PASSWORD_METHOD &&
                     HookUtils.methodSignatures(candidate) == listOf(Bundle::class.java.name)
-            } ?: error("密码屏改道方法未找到：$PASSWORD_CLASS.$PASSWORD_METHOD")
+            }
+            check(candidates.size == 1) {
+                "密码屏改道方法候选异常：$PASSWORD_CLASS.$PASSWORD_METHOD 命中 ${candidates.size} 个"
+            }
+            val method = candidates.single()
             check(method.returnType.name == HookUtils.VOID_TYPE) { "密码屏改道方法返回类型已变化" }
 
             method.isAccessible = true

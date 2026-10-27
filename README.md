@@ -33,6 +33,30 @@
 
 ## 变更记录
 
+### 2.7-provenance
+
+这一版引入了「类来源」观测，并因此发现了一个此前完全不可见的结构性问题：**QQ 自己的 Tinker 补丁是真的在跑的**。
+
+- **实测确认 QQ 进程里 `AppSetting` 有两个类对象**。新增的类来源探针打出：
+  ```
+  [app]  类来源 AppSetting loader=PathClassLoader            dex=[base.apk]
+  [dlcl] 类来源 AppSetting loader=DelegateLastClassLoader    dex=[TINKER:tinker_classN.apk]
+  ```
+  业务实际使用的是**补丁那一份**。也就是说 `[app]` 那次安装打在 base.apk 的类上，日志同样显示「6 条规则全装上」，却完全没有作用 —— 平板模式的正确性此前完全押在 `DelegateLastClassLoader` 这一条通路上，而这是本模块最难发现的失效模式。
+- **新增 Tinker loader 备份通路**：除了 `DelegateLastClassLoader`，同时挂 `com.tencent.tinker.loader.TinkerClassLoader` 的构造器（真机验证该通路 hook x1 成功）。两条通路互为备份，`installOn` 按 loader 引用去重，不会重复安装。
+- **新增启动自检 `LOADER_COVERAGE`**：补丁目录存在时，启动 5 秒后检查是否真的捕获到补丁 loader，没有就直接报「本次平板模式不会生效」，而不是让人从一堆「已接管」日志里自己推。
+- **`summary` 增加 `loaders=[...]`**：明确写出规则装在哪些 loader 上。只有 `loaders=[app]` 时不可视为正常。
+- **修复 NT 会话拦截体可能整条被跳过**（本轮最严重的一条）。`hookSessionInit` 是全模块唯一「`chain.proceed()` 写在最后」的拦截点：`dump` / `override` 里任何未捕获异常都会被 `ExceptionMode.PROTECTIVE` 吞掉，后面的 `proceed()` 也就不再执行 —— NT 内核 init 等于完全没跑。现在整个改写逻辑包 `runCatching`，`proceed()` 无条件执行，异常单独记一条。
+- **补上「原生 init 确实执行了」的硬证据**。此前日志里有 `(before)` 却没有 `(after)`，存在两种完全不同的解释：拦截体中途抛了（`proceed` 被跳过），或者 init 压根没被调用 —— 对 QQ 的影响天差地别，却无法从日志区分。现在 `proceed()` 之后会记一条「已执行原生 init」。
+- **`InitSessionConfig` 的 dump 去重键改为 `tag@stage`**。2.5 曾把 before/after 共用的标志拆开，但线上实测仍是 `before=8 / after=0` —— 因为 `[app]` 与 `[dlcl]` 是两个 loader、两份独立的 config 对象，只按 stage 去重会让后到的那份永远打不出来。这次按 loader 与阶段双重去重。
+- **`onPackageReady` 的进程名增加 `/proc/self/cmdline` 兜底，日志前移**。原来第一行就是 `targetProcessName ?: return`，而 `onModuleLoaded` 没给出进程名时该进程会彻底静默 —— 事后既看不到 hook 失败，也看不到「跳过了」。现在任何跳过都会留下原因。
+  - 顺带确认了一条走不通的路：`applicationInfo.processName` 返回的是包名（`:MSF` 里也是 `com.tencent.mobileqq`），拿不到真实进程名，不能拿它兜底。
+- **`install()` 分阶段异常隔离，DLCL 提前到最前**。原来 `installOn` / `hookDelegateLoader` / `logSummary` 三步裸调用串行，`installOn` 一抛异常，`hookDelegateLoader` 就再也不会执行 —— 而它正是拿到补丁 loader 的唯一途径。
+- **`installOn` 内五条规则也各自独立兜异常**：某条规则因插件 loader 缺依赖类而抛出，不再连累后面几条。
+- **`installed` / `failed` 改为互斥并共用一把锁**。同一条规则先装成功、随后运行时改写失败（`InitSessionConfig` 回滚）时，summary 会打出 `installed=6 failed=1` 这种自相矛盾的行。现在 `failed` 会把该规则从 `installed` 移除。
+- **`reentry` 回调时更新 `appLoader`**（仅当新 loader 能加载到 `BaseApplication`）。原实现只在首次回调时记录，`:MSF` 这类拿不到 Application 的进程会一直用最初的 loader 去找 `BaseApplication`，凭证长期走常量兜底。
+- 微信密码屏改道的 `firstOrNull` 改为 `filter + 唯一性校验`，与折叠屏白名单统一。
+
 ### 2.6-resilient
 
 这一版仍然不改变上报给服务端的数值，修的是「会不会整个装不上 / 装上了不生效」这一类问题。
@@ -165,3 +189,9 @@ QQ 的多端在线按**平台大类**判定互斥：安卓手机和伪装成平�
 `InitSessionConfig.deviceInfo` 里的机型信息（`devName` / `vendorName` / `osVer`）保持真实值，没有跟着 `deviceType=KPAD` 一起伪装成平板型号。刻意如此：改机型只会引入更多与真实硬件矛盾的字段，风险大于收益；但这也意味着「客户端类型是平板、设备名是真机型号」是本模块已知的可观测面。真机实测服务端接受该组合（在线设备列表 `client_type=7`）。
 
 微信侧 `inTabletEnv` 与副设备登录资格两个方法依赖 DexKit 动态定位，缓存按版本号失效；折叠屏白名单 `com.tencent.mm.ui.ok.R()` 与密码页 `LoginPasswordUI` 是固定类名，微信改这两处时只会丢对应辅助功能（折叠屏适配 / 密码页改道），不影响平板登录主链路，日志里会有 `wechat R hook FAILED` / `wechat password hook FAILED`。
+
+**QQ 的 Tinker 补丁是活的，这是本模块最脆弱的一环。** 真机实测 `/data/data/com.tencent.mobileqq/tinker/patch-<hash>/dex/tinker_classN.apk` 达 **421MB**（同版本号全量 dex 替换），补丁里的 `AppSetting` 由 `DelegateLastClassLoader` 定义，与 base.apk 那份是**两个不同的类对象**，业务只用补丁那份。所以：
+
+- 生效与否取决于是否在补丁 loader 上装过 hook，判断依据是日志里的 `loaders=[...]` 是否包含 `dlcl` / `tinker`；
+- 每次 QQ 下发新补丁，理论上需要重启进程重新挂钩（补丁在 Application 创建期加载，此时我们已完成挂钩，实测顺序正确）；
+- 若哪天 QQ 换掉补丁 loader 实现，`LOADER_COVERAGE` 会直接报异常，不用再从「已接管」日志里猜。

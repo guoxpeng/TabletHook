@@ -46,8 +46,20 @@ internal class QqHook(
     private var processName: String = PACKAGE_NAME
     private var appDataDir: String? = null
 
+    /** 规则汇总用同一把锁，避免 installed / failed 两个集合各自加锁时出现不一致快照。 */
+    private val rulesLock = Any()
     private val installedRules = linkedSetOf<String>()
     private val failedRules = linkedSetOf<String>()
+
+    /**
+     * 实际承担过安装的 loader 标签（app / dlcl / tinker / reentry）。
+     *
+     * 必要性来自实测：QQ 启用了 Tinker 全量补丁，`AppSetting` 在进程里有两个类对象 ——
+     * base.apk 一个、补丁一个，业务用的是补丁那份。只在 `[app]` 上装成功时日志同样显示
+     * 「6 条规则全装上」，但实际毫无作用。把装过哪些 loader 写进汇总，才不会把
+     * 「装在了没人用的类上」误读成「一切正常」。
+     */
+    private val appliedTags: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
     private val probedKeys: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     /** 会话配置 dump 的 stage 去重（before / after 各自一次）。 */
@@ -106,7 +118,17 @@ internal class QqHook(
             // 否则第二次回调带来的那个「更正确」的 loader 会漏装。
             if (classLoader !== appLoader) {
                 log("[reentry] 重复 install 回调，补装到新 loader：${classLoader.javaClass.name}")
-                installOn(classLoader, "reentry")
+                // 新 loader 往往比首次回调时的更接近真实业务 loader（首次可能只是
+                // base.apk 的 PathClassLoader）。appContext() 的 BaseApplication 兜底
+                // 依赖 appLoader，一直用旧的话，:MSF 这种拿不到 Application 的进程
+                // 会一直读不到 manifest —— 表现为「凭证长期走常量兜底」。
+                if (canLoadBaseApplication(classLoader)) {
+                    appLoader = classLoader
+                    log("[reentry] appLoader 已更新为：${classLoader.javaClass.name}")
+                }
+                runCatching { installOn(classLoader, "reentry") }.onFailure {
+                    log("[reentry] installOn 阶段异常：$it")
+                }
             } else {
                 log("[skip] 重复 install 回调，同一 loader 已装过，忽略")
             }
@@ -116,18 +138,76 @@ internal class QqHook(
         if (ModuleConfig.LOG_DEVICE_PROFILE) {
             logDeviceProfile(processName)
         }
-        installOn(classLoader, "app")
-        hookDelegateLoader()
-        logSummary()
+        // 三个阶段各自独立兜异常，且把最关键的 DelegateLastClassLoader 放到最前面。
+        //
+        // 原来这三步是裸调用串行执行：`installOn` 里任何一处抛出（比如某个 loader 里的
+        // AppSetting 依赖类缺失，`declaredMethods` 触发 NoClassDefFoundError），
+        // 后面的 `hookDelegateLoader()` 就再也不会执行 —— 而 DLCL 钩子是「拿到插件真实
+        // loader」的唯一途径，它没装上，NT 相关类会全部漏 hook，且日志里只有一句
+        // 初始化失败，看不出到底是哪一步断的。
+        runCatching { hookDelegateLoader() }.onFailure {
+            log("hookDelegateLoader 阶段异常：$it")
+        }
+        runCatching { installOn(classLoader, "app") }.onFailure {
+            log("installOn(app) 阶段异常：$it")
+        }
+        runCatching { logSummary() }.onFailure {
+            log("logSummary 阶段异常：$it")
+        }
+        scheduleLoaderCoverageCheck()
+    }
+
+    /**
+     * 启动 5 秒后自检一次「业务真正使用的 loader 有没有被覆盖」。
+     *
+     * 这是针对本模块最隐蔽失效模式的兜底判断。实测 QQ 加载 Tinker 全量补丁后，
+     * 同一进程里 `AppSetting` 有两个类对象：base.apk 一个、补丁一个，业务只用补丁那份。
+     * 如果补丁 loader 没被捕获，`[app]` 那次安装照样打出「6 条规则全装上」，
+     * summary 也显示 installed=6 failed=0 —— 一切看起来正常，功能却是死的。
+     *
+     * 只在「补丁目录存在」时才起这个线程，正常场景（无补丁）零开销。
+     */
+    private fun scheduleLoaderCoverageCheck() {
+        if (!tinkerPatchPresent()) {
+            return
+        }
+        Thread {
+            runCatching {
+                Thread.sleep(LOADER_COVERAGE_DELAY_MS)
+                val tags = appliedTags.toList()
+                val covered = tags.contains("dlcl") || tags.contains("tinker")
+                if (covered) {
+                    log("LOADER_COVERAGE 正常：补丁 loader 已覆盖 loaders=[${tags.joinToString(",")}]")
+                } else {
+                    log(
+                        "LOADER_COVERAGE 异常：Tinker 补丁存在，但 ${LOADER_COVERAGE_DELAY_MS}ms 内没有" +
+                            "捕获到补丁 loader，hook 只装在 [${tags.joinToString(",")}] 上。" +
+                            "若业务类由补丁定义，本次平板模式不会生效（设备上服务端大概率仍显示手机）"
+                    )
+                }
+            }
+        }.apply {
+            isDaemon = true
+            name = "qq-loader-coverage"
+        }.start()
     }
 
     /** 一条规则装完了，记下来用于最后汇总。 */
     private fun markInstalled(ruleId: String) {
-        synchronized(installedRules) { installedRules.add(ruleId) }
+        synchronized(rulesLock) {
+            installedRules.add(ruleId)
+            // 互斥：同一条规则可能先安装成功、随后在运行时改写失败（比如
+            // InitSessionConfig 写入失败回滚）。两个集合同时包含它，summary 会打出
+            // installed=6 failed=1 这种自相矛盾的行，排查时反而被误导。
+            failedRules.remove(ruleId)
+        }
     }
 
     private fun markFailed(ruleId: String) {
-        synchronized(failedRules) { failedRules.add(ruleId) }
+        synchronized(rulesLock) {
+            failedRules.add(ruleId)
+            installedRules.remove(ruleId)
+        }
     }
 
     /**
@@ -136,10 +216,12 @@ internal class QqHook(
      * 排查时只看这一行就够——不用再猜是模块没生效还是 QQ 改了签名。
      */
     private fun logSummary() {
-        val ok = synchronized(installedRules) { installedRules.toList() }
-        val bad = synchronized(failedRules) { failedRules.toList() }
+        val (ok, bad) = synchronized(rulesLock) {
+            installedRules.toList() to failedRules.toList()
+        }
         val line = "rule-runtime event=summary process=$processName installed=${ok.size}" +
             " failed=${bad.size}" +
+            " loaders=[${appliedTags.joinToString(",")}]" +
             (if (ok.isEmpty()) "" else " ok=[${ok.joinToString(",")}]") +
             (if (bad.isEmpty()) "" else " bad=[${bad.joinToString(",")}]")
         log(line)
@@ -148,39 +230,74 @@ internal class QqHook(
     // ---------------- 类加载器 ----------------
 
     /**
-     * QQ 用 DelegateLastClassLoader 做插件化，真正加载业务类的 loader 不是 onPackageReady 给的那个。
-     * 抓构造器拿到真实 loader 再补装一遍，否则 NT 相关类会漏。
+     * QQ 用 Tinker 做全量 dex 替换（实测 `tinker/patch-<hash>/dex/tinker_classN.apk`
+     * 达 421MB），补丁里的类由 **DelegateLastClassLoader** 定义 —— 已由类来源探针实测：
+     *
+     * ```
+     * [app]  类来源 AppSetting loader=PathClassLoader            dex=[base.apk]
+     * [dlcl] 类来源 AppSetting loader=DelegateLastClassLoader    dex=[TINKER:tinker_classN.apk]
+     * ```
+     *
+     * 也就是说同一个进程里存在**两个不同的 AppSetting 类对象**，业务实际使用的是补丁那份。
+     * `[app]` 那次安装打在 base.apk 的类上，日志同样打出「6 条规则全装上」，但完全没有作用。
+     *
+     * 后果：平板模式的正确性完全押在 DLCL 这一条通路上。一旦这个 loader 换实现或不存在
+     * （`DelegateLastClassLoader` 是 API 27 才有的类），业务类就再也不会被 hook，
+     * 而所有日志看起来都正常 —— 这是本模块最难发现的失效。
+     *
+     * 因此这里同时挂 Tinker 自己的 `TinkerClassLoader`：两条通路互为备份，
+     * `installOn` 内部按 loader 引用去重，不会重复安装。
      */
     private fun hookDelegateLoader() {
         if (!delegateLoaderHooked.compareAndSet(false, true)) {
             return
         }
-        val cls = runCatching {
-            Class.forName("dalvik.system.DelegateLastClassLoader", false, null)
-        }.getOrNull()
+        // 系统类，用 bootstrap loader 即可解析。
+        hookLoaderConstructors(
+            className = DLCL_CLASS,
+            loader = null,
+            tag = "dlcl",
+            hookId = DELEGATE_LOADER_HOOK_ID
+        )
+        // Tinker 的 loader 是应用类，必须用 QQ 的 loader 解析；不存在就说明这条通路不适用。
+        hookLoaderConstructors(
+            className = TINKER_LOADER_CLASS,
+            loader = appLoader,
+            tag = "tinker",
+            hookId = TINKER_LOADER_HOOK_ID
+        )
+    }
+
+    private fun hookLoaderConstructors(
+        className: String,
+        loader: ClassLoader?,
+        tag: String,
+        hookId: String
+    ) {
+        val cls = runCatching { Class.forName(className, false, loader) }.getOrNull()
         if (cls == null) {
-            log("DelegateLastClassLoader 不存在，跳过（低版本 or 非 ART）")
+            log("$className 不存在，跳过（该 loader 类型未被 QQ 使用）")
             return
         }
         var count = 0
         var failed = 0
-        // 逐个构造器单独兜异常：5 个里某一个（比如已废弃的那个）挂不上，
-        // 不能让其余 4 个跟着一起不装 —— 原来整个循环共用一个 runCatching。
+        // 逐个构造器单独兜异常：某个（比如已废弃的那个）挂不上，
+        // 不能让其余几个跟着一起不装。
         for (ctor in cls.declaredConstructors) {
             val ok = runCatching {
                 ctor.isAccessible = true
-                HookUtils.safeHook(xposed, ctor, DELEGATE_LOADER_HOOK_ID)
+                HookUtils.safeHook(xposed, ctor, hookId)
                     .intercept { chain ->
                         val result = chain.proceed()
                         runCatching {
-                            (chain.thisObject as? ClassLoader)?.let { installOn(it, "dlcl") }
+                            (chain.thisObject as? ClassLoader)?.let { installOn(it, tag) }
                         }
                         result
                     }
             }.isSuccess
             if (ok) count++ else failed++
         }
-        log("DelegateLastClassLoader 构造器已 hook x$count（失败 $failed）")
+        log("$className 构造器已 hook x$count（失败 $failed）")
     }
 
     private fun installOn(loader: ClassLoader, tag: String) {
@@ -206,18 +323,33 @@ internal class QqHook(
                 return
             }
         }
+        appliedTags.add(tag)
         log("[$tag] 开始安装 QQ 平板 hook：${loader.javaClass.name}")
-        hookAppSetting(appSetting, tag)
-        hookPadUtil(loader, tag)
-        hookIsPadForMultiDeviceLogin(loader, tag)
-        hookSessionInit(loader, tag)
-        hookRegisterProxy(loader, tag)
+        // 每条规则独立兜异常。原来五条裸调用串行执行，`hookAppSetting` 里任何一处抛出
+        // （例如插件 loader 缺依赖类时 `declaredMethods` 触发 NoClassDefFoundError）
+        // 后面四条就全部不装，而且只有一句「初始化失败」看不出断在哪。
+        runCatching { hookAppSetting(appSetting, tag) }
+            .onFailure { log("[$tag] hookAppSetting 阶段异常：$it") }
+        runCatching { hookPadUtil(loader, tag) }
+            .onFailure { log("[$tag] hookPadUtil 阶段异常：$it") }
+        runCatching { hookIsPadForMultiDeviceLogin(loader, tag) }
+            .onFailure { log("[$tag] hookIsPadForMultiDeviceLogin 阶段异常：$it") }
+        runCatching { hookSessionInit(loader, tag) }
+            .onFailure { log("[$tag] hookSessionInit 阶段异常：$it") }
+        runCatching { hookRegisterProxy(loader, tag) }
+            .onFailure { log("[$tag] hookRegisterProxy 阶段异常：$it") }
+        // 后到的 loader（dlcl / tinker）才是业务真正在用的那一份，
+        // 装完补打一条汇总，否则只看首条 summary 会漏掉它。
+        if (tag != "app") {
+            runCatching { logSummary() }
+        }
     }
 
     // ---------------- AppSetting ----------------
 
     private fun hookAppSetting(appSetting: Class<*>, tag: String) {
         appSettingClass = appSetting
+        logClassProvenance(appSetting, tag)
         probeAppSettingFields(appSetting, tag)
 
         val statics = appSetting.declaredMethods.filter { method ->
@@ -283,6 +415,93 @@ internal class QqHook(
             }.onFailure { log("[$tag] ${RULE_APP_SETTING_FLAG} hook 失败：$it") }
         } ?: markFailed(RULE_APP_SETTING_FLAG)
     }
+
+    /**
+     * 记录「我们 hook 的这个类究竟来自哪个 dex」。
+     *
+     * QQ 同样启用了 Tinker：实测 `/data/data/com.tencent.mobileqq/tinker/` 下有
+     * `patch-<hash>/dex/tinker_classN.apk`（**421MB，全量 dex 替换**，不是小补丁）。
+     *
+     * 这是本模块最不容易发现的一类失效：如果补丁已加载，业务代码用的是补丁里的
+     * `AppSetting`，而我们在 `onPackageReady` 阶段 `Class.forName` 拿到并 hook 的
+     * 可能是 base.apk 里的同名类 —— 两者不是同一个 Class 对象，hook 装上、日志正常，
+     * 但对运行中的代码毫无影响。微信侧早就用 `definedBy` 记了这件事，QQ 侧一直没有。
+     *
+     * 这里同时记录 dex 里是否出现 tinker 路径，以及「补丁目录存在但没加载」的提示，
+     * 让这类失效在日志里一眼可判，而不是只能靠猜。
+     */
+    private fun logClassProvenance(cls: Class<*>, tag: String) {
+        if (!probedKeys.add("provenance@$tag@$processName")) {
+            return
+        }
+        runCatching {
+            val loader = cls.classLoader
+            val paths = dexPathsOf(loader)
+            val tinkerLoaded = paths.any { it.contains("tinker", ignoreCase = true) }
+            val shown = paths.joinToString(",") { path ->
+                val name = path.substringAfterLast('/')
+                if (path.contains("tinker", ignoreCase = true)) "TINKER:$name" else name
+            }
+            log(
+                "[$tag] 类来源 ${cls.name} loader=${loader?.javaClass?.name ?: "bootstrap"} " +
+                    "tinkerLoaded=$tinkerLoaded dex=[${shown.take(400)}]"
+            )
+            if (!tinkerLoaded && tinkerPatchPresent()) {
+                log(
+                    "[$tag] 提示：Tinker 补丁目录存在但当前未加载，hook 打在 base.apk 的类上。" +
+                        "QQ 之后若启用补丁需重启进程重新挂钩，否则可能作用于错误的类对象"
+                )
+            }
+        }.onFailure { log("[$tag] 类来源探针失败：$it") }
+    }
+
+    /** `tinker/` 下是否存在 `patch-*` 目录（只判断存在性，不读内容）。 */
+    private fun tinkerPatchPresent(): Boolean = runCatching {
+        val dir = java.io.File(appDataDir ?: return@runCatching false, "tinker")
+        dir.isDirectory && dir.list()?.any { it.startsWith("patch") } == true
+    }.getOrDefault(false)
+
+    /**
+     * 取一个 ClassLoader 实际加载的全部 dex / apk 路径。
+     *
+     * 走 `BaseDexClassLoader.pathList.dexElements[].path`（Android 8+ 为 `path`，
+     * 更早版本为 `file`），只读不改。拿不到就返回空列表，不影响任何 hook 行为。
+     */
+    private fun dexPathsOf(loader: ClassLoader?): List<String> {
+        if (loader == null) {
+            return emptyList()
+        }
+        return runCatching {
+            var cls: Class<*>? = loader.javaClass
+            var pathListField: Field? = null
+            while (cls != null && pathListField == null) {
+                pathListField = runCatching { cls.getDeclaredField("pathList") }.getOrNull()
+                cls = cls.superclass
+            }
+            val pathList = pathListField?.apply { isAccessible = true }?.get(loader)
+                ?: return@runCatching emptyList()
+            val elementsField = runCatching {
+                pathList.javaClass.getDeclaredField("dexElements")
+            }.getOrNull() ?: return@runCatching emptyList()
+            elementsField.isAccessible = true
+            val elements = elementsField.get(pathList) as? Array<*> ?: return@runCatching emptyList()
+            elements.mapNotNull { element -> element?.let { elementPath(it) } }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun elementPath(element: Any): String? = runCatching {
+        element.javaClass.declaredFields.firstNotNullOfOrNull { field ->
+            if (field.name != "path" && field.name != "file") {
+                return@firstNotNullOfOrNull null
+            }
+            field.isAccessible = true
+            when (val value = field.get(element)) {
+                is String -> value
+                is java.io.File -> value.absolutePath
+                else -> null
+            }
+        }
+    }.getOrNull()
 
     /**
      * 主动触发一次原生 `AppSetting.a()` 链上的初始化。
@@ -489,6 +708,17 @@ internal class QqHook(
                 .invoke(null) as? Context
         }.getOrNull()
     }
+
+    /**
+     * 这个 loader 能不能找到 QQ 自己的 `BaseApplication`。
+     *
+     * 用来判断「它是否值得替换 appLoader」：能加载到说明它看得见 QQ 的 application 类，
+     * 拿 `getContext()` 的兜底路径才成立；加载不到说明是某个插件 loader，换上去反而更差。
+     */
+    private fun canLoadBaseApplication(loader: ClassLoader): Boolean = runCatching {
+        Class.forName("com.tencent.qphone.base.util.BaseApplication", false, loader)
+        true
+    }.getOrDefault(false)
 
     /** key 打日志时脱敏，只留头尾确认「是不是同一串」。 */
     private fun maskKey(key: String): String =
@@ -720,22 +950,45 @@ internal class QqHook(
             method.isAccessible = true
             HookUtils.safeHook(xposed, method, RULE_SESSION_INIT)
                 .intercept { chain ->
-                    val config = chain.getArg(0)
-                    if (config != null) {
+                    // 改写逻辑整体包起来，但 chain.proceed() 必须无条件执行。
+                    //
+                    // 这是全模块唯一「proceed 在最后」的拦截点，也曾经是唯一可能整条被跳过的：
+                    // 一旦 dump / override 里抛出未捕获异常，异常被 PROTECTIVE 模式吞掉，
+                    // 后面的 chain.proceed() 也就不会执行 —— 表现是 NT 内核 init 完全没跑，
+                    // 而日志里只留下一条 (before)，连异常都看不到（线上实测 after 记录恒为 0）。
+                    // init 是内核建立会话的必经调用，跳过它等于把 QQ 的通信层拆掉。
+                    runCatching {
+                        val config = chain.getArg(0) ?: return@runCatching
                         // dump 放在 dry-run 判断之外：诊断模式下正是要看「本来报什么」。
                         if (ModuleConfig.LOG_QQ_SESSION) {
                             dumpSessionConfig(tag, config, "before")
                         }
                         if (!ModuleConfig.QQ_DRY_RUN) {
-                            if (!overrideSessionConfig(config, pad, androidPlatform, tag)) {
-                                markFailed(RULE_SESSION_INIT)
-                            }
+                            val applied = overrideSessionConfig(config, pad, androidPlatform, tag)
                             if (ModuleConfig.LOG_QQ_SESSION) {
                                 dumpSessionConfig(tag, config, "after")
                             }
+                            if (!applied) {
+                                markFailed(RULE_SESSION_INIT)
+                            }
                         }
+                    }.onFailure { throwable ->
+                        logOnce(
+                            "$RULE_SESSION_INIT@intercept",
+                            "[$tag] $RULE_SESSION_INIT 拦截体异常（已吞，proceed 仍会执行）：$throwable"
+                        )
                     }
-                    chain.proceed()
+                    val result = chain.proceed()
+                    // 留一条「原生 init 确实跑到了」的硬证据。
+                    //
+                    // 没有这条时，日志里出现 (before) 却没有 (after) 有两种完全不同的解释：
+                    // 拦截体中途抛了（proceed 被跳过），或者 init 压根没被调用。
+                    // 两者对 QQ 的影响天差地别，却无法从日志区分。
+                    logOnce(
+                        "$RULE_SESSION_INIT@proceeded",
+                        "[$tag] $RULE_SESSION_INIT 已执行原生 init（会话建立未被跳过）"
+                    )
+                    result
                 }
             HookUtils.ruleInstalled(RULE_SESSION_INIT, 1, processName)
             markInstalled(RULE_SESSION_INIT)
@@ -796,10 +1049,11 @@ internal class QqHook(
                     .append(",osVer=").append(getField(deviceInfo, "osVer"))
                     .append('}')
             }
-            // 按 stage 去重：before / after 各打一次。
-            // 原来共用一个 sessionLogged 标志，before 先把它置位，after 永远打不出来，
-            // 「对比改前改后」这个功能实际从未生效。
-            if (dumpedStages.add(stage)) {
+            // 按「安装阶段 + 阶段名」去重：`[app]` 与 `[dlcl]` 是两个独立的 loader，
+            // 各自看到的 InitSessionConfig 是不同的对象，合并去重会让后来者永远打不出来。
+            // 原来只按 stage 去重，且 before 先把自己置位，after 实际一次都没打出来过
+            // （线上日志实测 before=8 / after=0），诊断功能等于不存在。
+            if (dumpedStages.add("$tag@$stage")) {
                 log(builder.toString())
             }
         }
@@ -962,6 +1216,16 @@ internal class QqHook(
         private const val RULE_ONLINE_DEVICES = "qq_online_devices_001"
 
         private const val DELEGATE_LOADER_HOOK_ID = "qq_delegate_loader"
+
+        /** 系统类：Android 8.1+ 才有，QQ 的 Tinker 补丁实际由它定义。 */
+        private const val DLCL_CLASS = "dalvik.system.DelegateLastClassLoader"
+
+        /** Tinker 自带的补丁 loader：DLCL 通路不可用时的备份落点。 */
+        private const val TINKER_LOADER_CLASS = "com.tencent.tinker.loader.TinkerClassLoader"
+        private const val TINKER_LOADER_HOOK_ID = "qq_tinker_loader"
+
+        /** 启动后多久检查「补丁 loader 是否被覆盖」。QQ 的 Tinker 在 Application 创建后很快完成。 */
+        private const val LOADER_COVERAGE_DELAY_MS = 5_000L
 
         /** 探针内部用的去重键，不是真实 hook 规则。 */
         private const val RULE_PROBE_FIELDS = "qq_probe_appsetting_fields"
