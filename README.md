@@ -6,12 +6,15 @@
 
 ## 与上游的差异
 
-| 项目 | 上游 TabletHook | 本分支 2.1-cached |
+| 项目 | 上游 TabletHook | 本分支 |
 | --- | --- | --- |
 | 拼多多平板登录 | 支持 | **已删除**（`PddHook` 整体移除，含作用域） |
 | 微信平板登录 | 支持 | 保留，并补充折叠屏白名单、密码页改道 |
 | 微信 DexKit 定位 | 每次启动全量扫描 | **结果缓存**，命中即跳过 DexKit |
+| 微信热补丁 | 不处理 | 等 Tinker 就绪后再挂钩 |
 | QQ 平板登录 | 仅 MSF 客户端类型（DexKit 动态定位） | 重写为固定类名实现，覆盖 AppSetting / PadUtil / 多设备判定 / NT 会话，完全不依赖 DexKit |
+| QQ 平板 appid | 无（不实现） | **跟随 QQ 原生返回值**，写死值仅作兜底 |
+| 失败处理 | 静默 | 每条规则有不可变 ID，装不上明确打 `NO_COMPATIBLE_RULE` |
 | 屏幕画像伪装 | 无 | 无（曾实现后删除，理由见下） |
 | 模块入口 | `TabletHook.kt` | `QqPadEntry.kt` |
 | 应用名 | TabletHook | 微Q平板模块 |
@@ -29,6 +32,19 @@
 | QQ | `com.tencent.mobileqq` | `9.3.35` | `15560` | 9.3.75（`42350`） |
 
 ## 变更记录
+
+### 2.4.1-adaptive
+
+- **QQ 平板 appid 改为跟随原生**：`AppSetting.e()` / `i()` 不再无脑返回写死值，而是先取一次原生返回值。只要原生 `o()` 走过平板分支，就采用原生给出的 appid / key；只有原生仍判为手机时才回退到常量。
+- 意义：QQ 换代更换平板 appid 时，模块自动跟随，不会再出现「客户端自称平板、服务端不认」的**静默降级**。
+- `key` 与 `appid` 强制同源：`i()` 若发现平板判定尚未确认，会先触发一次 `e()` 补齐判定，避免 appid 跟随新版而 key 仍兜底旧值。
+- NT `InitSessionConfig` 的 appid 同步改为从当前解析结果读取，不再写死。
+
+### 2.2-rules
+
+- **QQ 每条 hook 加不可变规则 ID**（`qq_app_setting_appid_001`、`qq_pad_util_001`、`qq_session_init_001` 等共 7 条），并要求「刚好命中一个」才挂载。
+- 匹配不到或匹配到多个时记录 `NO_COMPATIBLE_RULE`（含 `TARGET_NOT_FOUND` / `AMBIGUOUS_TARGET n=` / `SIGNATURE_CHANGED` / `ENUM_MISSING`），并在启动时输出汇总：`rule-runtime event=summary installed=N failed=M ok=[...] bad=[...]`。失败不再静默。
+- **微信等 Tinker 就绪后再挂钩**：先探测 `TinkerApplication`，存在则等 `onBaseContextAttached` 之后用热补丁 classloader 安装，避免热更新后 hook 指向旧代码；另设 3 秒兜底，防止未走 `super` 时永不回调。
 
 ### 2.1-cached
 
@@ -67,8 +83,8 @@
 - 使用 `libxposed API 102` 接入 Xposed 生命周期和 Hook API。
 - **微信**：用 `DexKit 2.2.0` 按字符串（`inTabletEnv`、`/cgi-bin/micromsg-bin/checkloginaspad`）动态定位平板环境判定与副设备登录资格方法，不依赖固定混淆类名；定位结果带签名缓存。
 - **QQ**：直接用 QQ 9.3 系列稳定的固定类名（`com.tencent.common.config.AppSetting`、`com.tencent.common.config.pad.PadUtil`、`com.tencent.qqnt.kernel.nativeinterface.InitSessionConfig` 等），不引入 DexKit。
-- QQ 平板 appid / key 取自 QQ 自身清单里的 `AppSetting_params_pad`（`537397816` / `0FFD632C4B7E08AF`），不是外部硬编的猜测值。
-- 对关键候选执行数量和签名校验，匹配异常时记录错误，不使用不确定结果。
+- QQ 平板 appid / key **优先取 QQ 原生的返回值**（原生 `o()` 为真时其自身就会给出平板组合），代码里的 `537397816` / `0FFD632C4B7E08AF` 仅作原生仍走手机分支时的兜底。
+- 对关键候选执行数量和签名校验，匹配异常时记录规则 ID 与原因，不使用不确定结果。
 
 动态定位只能降低版本变化带来的影响，不能保证所有后续版本自动兼容。目标应用更新后如出现匹配失败，需要结合日志重新分析。
 

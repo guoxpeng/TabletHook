@@ -31,7 +31,9 @@ internal class WeChatHook(
     private val xposed: XposedInterface
 ) {
     fun install(bridge: DexKitBridge, classLoader: ClassLoader, appDataDir: String?) {
-        HookUtils.logi("wechat install start dataDir=$appDataDir")
+        HookUtils.logi(
+            "wechat install start dataDir=$appDataDir loader=${classLoader.javaClass.name}"
+        )
         if (appDataDir != null && tryCachedHook(classLoader, appDataDir)) {
             HookUtils.logi("wechat cache HIT hook installed")
             return
@@ -92,6 +94,14 @@ internal class WeChatHook(
             eligibilityMatches,
             "微信副设备登录资格方法"
         ).getMethodInstance(classLoader)
+
+        // 打一条类的定义 loader：Tinker 场景下这里应该是补丁 loader，
+        // 如果显示的是 base.apk 的 PathClassLoader，说明拿到了旧代码、hook 不会生效。
+        HookUtils.logi(
+            "wechat env method=${tabletEnvironmentMethod.declaringClass.name}" +
+                "#${tabletEnvironmentMethod.name}" +
+                " definedBy=${tabletEnvironmentMethod.declaringClass.classLoader?.javaClass?.name}"
+        )
 
         hookBooleanMethod(tabletEnvironmentMethod, TABLET_ENVIRONMENT_HOOK_ID)
         hookBooleanMethod(loginAsPadEligibilityMethod, LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID)
@@ -154,6 +164,10 @@ internal class WeChatHook(
 
             env.isAccessible = true
             eligibility.isAccessible = true
+            HookUtils.logi(
+                "wechat cache env=${env.declaringClass.name}#${env.name}" +
+                    " definedBy=${env.declaringClass.classLoader?.javaClass?.name}"
+            )
             hookBooleanMethod(env, TABLET_ENVIRONMENT_HOOK_ID)
             hookBooleanMethod(eligibility, LOGIN_AS_PAD_ELIGIBILITY_HOOK_ID)
             hookFoldWhitelist(classLoader)

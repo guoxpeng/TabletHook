@@ -33,4 +33,25 @@ internal object ModuleConfig {
      * 含 appid / deviceType / 服务端在线设备条目，排查价值高，但可观测面也大。
      */
     const val LOG_QQ_SESSION = true
+
+    /**
+     * QQ 平板 appid 来源探针（只读）。
+     *
+     * 打开后 `e()` / `i()` / `o()` 会各记一行「原生值 / 最终选择」，每个进程只记一次。
+     * 这是判断「跟随原生」是否真的生效的直接依据，平时留着也几乎不占日志。
+     *
+     * 探针在 QQ 9.3.75 上得出的结论（已固化为跟随逻辑）：
+     * 原生 `o()` 为真时，`e()` 自己给出平板 appid（537397816），`i()` 给出对应 key，
+     * 与写死值一致 —— 说明硬编码只在原生仍走手机分支时才需要兜底。
+     */
+    const val PROBE_QQ_APP_ID = true
+
+    /**
+     * dump `AppSetting` 全部静态 int / String 字段。
+     *
+     * 用于确认「手机 appid / 平板 appid / key」分别落在哪个字段上（9.3.75 为
+     * f=537397776 / g=537397237 / i=B0FAC20A724CCF50 / j=C5EF37EE8FAB3E09）。
+     * 一次输出几十个字段，只在排查时打开。
+     */
+    const val PROBE_QQ_APP_SETTING_FIELDS = false
 }

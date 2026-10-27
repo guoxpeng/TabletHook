@@ -73,6 +73,41 @@ internal object HookUtils {
         return values.first()
     }
 
+    /**
+     * 规则唯一性断言：刚好命中一个才返回，否则返回 null 并记一条失败事件。
+     *
+     * 借鉴 ImPad 的 fail-closed 思路——宁可把这条规则整条跳过、明确报
+     * `NO_COMPATIBLE_RULE`，也不要在多个候选里随便挑一个挂上去。挂错方法比
+     * 不挂更难排查：应用不会报错，只是行为莫名其妙不对。
+     */
+    fun uniqueMatchOrNull(
+        candidates: List<Method>,
+        ruleId: String,
+        label: String,
+        processName: String
+    ): Method? {
+        if (candidates.size == 1) {
+            return candidates.single()
+        }
+        val reason = if (candidates.isEmpty()) {
+            "TARGET_NOT_FOUND"
+        } else {
+            "AMBIGUOUS_TARGET n=${candidates.size}"
+        }
+        ruleFailure(ruleId, label, reason, processName)
+        return null
+    }
+
+    /** 一条规则安装成功。 */
+    fun ruleInstalled(ruleId: String, hookCount: Int, processName: String) {
+        logi("rule-runtime event=hook_installed ruleId=$ruleId hookCount=$hookCount processName=$processName")
+    }
+
+    /** 一条规则在当前应用构建上不可用，明确失败而不是静默跳过。 */
+    fun ruleFailure(ruleId: String, label: String, reason: String, processName: String) {
+        logi("rule-runtime event=NO_COMPATIBLE_RULE ruleId=$ruleId label=$label reason=$reason processName=$processName")
+    }
+
     fun methodSignatures(method: Method): List<String> =
         method.parameterTypes.map { it.name }
 
